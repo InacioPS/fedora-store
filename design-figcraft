@@ -1,0 +1,124 @@
+Crie o design de uma loja de aplicativos desktop para Fedora, voltada a pessoas que usam window managers. Use GTK4 e libadwaita como referência visual: interface limpa, funcional, amigável e integrada ao estilo GNOME. Não faça uma página web; desenhe uma aplicação desktop.
+
+OBJETIVO DO PRODUTO
+A loja permite explorar aplicativos e pacotes, instalar, remover e atualizar programas, selecionar vários programas para uma operação e gerenciar fontes de pacotes DNF, Terra e COPR. O usuário deve conseguir entender facilmente de onde vem cada pacote e o que acontecerá antes de confirmar uma operação.
+
+ESTILO VISUAL
+- Tema claro, com fundo cinza muito claro ou branco quente.
+- Azul como cor de destaque para ações principais e item selecionado.
+- Tipografia sans-serif simples, legível e hierarquia visual clara.
+- Cantos arredondados moderados, consistentes em botões, campos e cartões.
+- Ícones simples e reconhecíveis.
+- Espaçamento confortável entre grupos e alinhamento consistente.
+- Visual inspirado em libadwaita, sem excesso de bordas, sombras, gradientes ou elementos decorativos.
+- Não use logotipos ou símbolos do Fedora. Use um ícone genérico de loja ou uma identidade neutra.
+- Use badges de origem de pacote com texto: “DNF”, “Terra” e “COPR”.
+
+JANELA PRINCIPAL
+Crie uma janela desktop de aproximadamente 1440 × 900 px, com:
+- Barra superior discreta.
+- Título da página “Catálogo de aplicativos”.
+- Botão de recolher/expandir a sidebar.
+- Botão ou campo de busca.
+- Ações para filtros e ordenação.
+- Controles para alternar entre visualização em grade e lista.
+
+SIDEBAR
+Sidebar vertical à esquerda com:
+- Explorar
+- Instalados
+- Atualizações, com um pequeno contador quando houver atualizações
+- Fontes
+- Item ativo destacado com fundo azul suave e ícone.
+- Botão para recolher a sidebar, mantendo um modo compacto com apenas os ícones.
+
+ÁREA “EXPLORAR”
+- Campo de busca largo com o texto “Buscar aplicativos, pacotes e desenvolvedores”.
+- Filtros em chips ou controles segmentados: “Todos”, “Instalados”, “DNF”, “Terra”, “COPR”.
+- Controle de ordenação, por exemplo “Relevância”.
+- Grade adaptável de cartões de aplicativos.
+- Cada cartão deve apresentar:
+  - Ícone do aplicativo em tamanho destacado.
+  - Nome.
+  - Descrição curta, limitada a duas linhas.
+  - Badge da origem: “DNF”, “Terra” ou “COPR”.
+  - Botão de ação adequado ao estado.
+- Misture cartões disponíveis e instalados:
+  - Disponível: botão primário “Instalar”.
+  - Instalado: botão “Remover”.
+  - Atualizável: botão “Atualizar”.
+- Inclua um menu de opções secundárias para cada cartão, sem competir visualmente com a ação principal.
+
+DETALHE DO PACOTE
+Crie também uma tela ou painel de detalhes com:
+- Ícone maior, nome e descrição completa.
+- Origem do pacote claramente indicada.
+- Versão instalada e versão disponível, quando aplicável.
+- Botão principal “Instalar”, “Remover” ou “Atualizar”.
+- Informações sobre tamanho e dependências, se disponíveis.
+- Aviso visível quando a origem for COPR, identificando-a como projeto comunitário.
+
+TELA “INSTALADOS”
+- Campo de busca e filtros.
+- Lista ou grade de aplicativos instalados.
+- Cada item deve mostrar nome, ícone, origem, versão e botão “Remover”.
+- Permitir selecionar vários aplicativos e mostrar uma ação para remover os selecionados.
+- Não esconda a ação de remoção em menus difíceis de encontrar.
+
+TELA “ATUALIZAÇÕES”
+- Lista de pacotes com atualizações disponíveis.
+- Mostrar nome, versão atual, versão nova e origem.
+- Permitir atualizar um item ou todos.
+- Incluir botão “Atualizar tudo”.
+- Antes da operação, mostrar uma revisão resumida das mudanças.
+
+TELA “FONTES”
+- Seções separadas para DNF, Terra e COPR.
+- Mostrar quais fontes estão habilitadas.
+- Para Terra, permitir explorar os pacotes disponíveis.
+- Para COPR, permitir buscar projetos e ver:
+  - Nome do projeto.
+  - Mantenedor.
+  - Descrição.
+  - Pacotes publicados.
+  - Estado habilitado/desabilitado.
+- Mostrar claramente que COPR é uma fonte comunitária.
+- Antes de habilitar uma fonte ou instalar dela, explicar quais mudanças serão feitas e pedir confirmação.
+
+DIÁLOGO DE CONFIRMAÇÃO DE REMOÇÃO
+Desenhe um diálogo modal central, simples e acessível:
+- Título: “Remover aplicativo?”
+- Mensagem breve informando o nome do aplicativo.
+- Se houver dependências ou outros pacotes afetados, mostre isso de forma clara.
+- Botões “Cancelar” e “Remover”.
+- “Remover” deve ser a ação de confirmação e usar uma cor de perigo com moderação.
+- Evite um diálogo exageradamente grande ou visualmente dramático.
+
+REVISÃO DE TRANSAÇÃO
+Crie também um diálogo ou página de revisão antes de aplicar operações:
+- Título: “Revisar alterações”.
+- Listas separadas para instalar, atualizar e remover.
+- Mostrar a origem de cada pacote.
+- Mostrar dependências adicionais e possíveis remoções.
+- Botões “Cancelar” e “Confirmar”.
+- Usar linguagem simples, sem expor detalhes técnicos desnecessários.
+
+ESTADOS ADICIONAIS
+Inclua exemplos visuais de:
+- Busca sem resultados, com sugestão para alterar os filtros.
+- Repositório indisponível, com mensagem clara e ação “Tentar novamente”.
+- Operação em andamento, com indicador de progresso e descrição da ação.
+- Operação concluída, com notificação discreta de sucesso.
+
+ENTREGA
+Organize o resultado em telas ou frames separados:
+1. Explorar — grade de aplicativos.
+2. Instalados — com ações “Remover”.
+3. Atualizações.
+4. Fontes — DNF, Terra e COPR.
+5. Detalhes de um aplicativo.
+6. Diálogo de confirmação de remoção.
+7. Revisão de transação.
+
+Mantenha todos os frames visualmente consistentes e use nomes de componentes e textos em português. O resultado deve parecer uma loja de aplicativos desktop pronta para ser transformada em uma aplicação GTK4/libadwaita.
+

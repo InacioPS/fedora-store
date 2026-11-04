@@ -1,0 +1,1 @@
+"""Fedora Store desktop application."""
