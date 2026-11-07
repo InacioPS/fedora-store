@@ -69,14 +69,16 @@ SOURCES_DROPDOWN = ["Todas", "Fedora", "Terra", "COPR"]
 STYLE = b"""
 .fs-header-title { font-weight: 700; font-size: 16px; }
 .fs-topbar { border-bottom: 1px solid rgba(0, 0, 0, 0.07); }
-.fs-subnav { padding: 0 24px 8px; border-bottom: 1px solid rgba(0, 0, 0, 0.07); }
+.fs-sidebar { border-right: 1px solid rgba(0, 0, 0, 0.07); }
+.fs-sidebar-btn { min-width: 42px; min-height: 42px; padding: 0; }
+.fs-subnav { padding: 8px 24px 8px; border-bottom: 1px solid rgba(0, 0, 0, 0.07); }
 .fs-navbtn { font-weight: 600; border-width: 0px; background: none; color: #4A5158; padding: 5px 12px; min-height: 30px; border-radius: 999px; }
 .fs-navbtn:hover:not(:checked) { background: rgba(0, 0, 0, 0.06); }
 .fs-navbtn:checked { background: #D5E5FA; color: #205A9F; font-weight: 700; }
 .fs-heading { font-size: 32px; font-weight: 800; }
 .fs-page-title { font-size: 21px; font-weight: 700; }
 .fs-name { font-weight: 700; font-size: 17px; }
-.fs-search { min-height: 38px; padding: 0 10px; font-size: 15px; }
+.fs-search { min-height: 32px; padding: 0 10px; font-size: 15px; }
 .fs-chip { font-weight: 600; border-width: 0px; background: none; color: #555C63; padding: 5px 14px; border-radius: 8px; }
 .fs-chip:hover:not(:checked) { background: rgba(0, 0, 0, 0.05); }
 .fs-chip:checked { background: #D8E8FA; color: #245EA3; font-weight: 700; }
@@ -166,6 +168,7 @@ class FedoraStore(Adw.Application):
         self.view_mode = "grid"
         self.sort_mode = 0
         self.query_installed = ""
+        self.installed_source = 0
         self.query_updates = ""
         self.query_sources = ""
         self.copr_query = ""
@@ -179,6 +182,7 @@ class FedoraStore(Adw.Application):
         self._topnav_subnav: Gtk.Box | None = None
         self._topnav_labels: list[tuple[Gtk.Label, Gtk.Label | None]] = []
         self._topnav: Gtk.Box | None = None
+        self._root: Gtk.Box | None = None
 
         self.packages_installed: dict[str, dict] = {}
         self.packages_upgrades: list[dict] = []
@@ -202,6 +206,7 @@ class FedoraStore(Adw.Application):
         self.flatpak_search_token = 0
         self._source_settings_path = Path(GLib.get_user_config_dir()) / "fedora-store" / "sources.json"
         self.third_party_sources = self._load_source_preferences()
+        self.navigation_mode = self.third_party_sources.get("navigation", "topnav")
         self.repos: list[dict] = []
         self.local_rpm: dict[str, str] | None = None
         self.local_rpm_detail = False
@@ -233,15 +238,29 @@ class FedoraStore(Adw.Application):
         self._copr_loading: set[str] = set()
         self._copr_rows: dict[str, Adw.ExpanderRow] = {}
 
-    def _load_source_preferences(self) -> dict[str, bool]:
-        defaults = {"flatpak": False, "terra": False, "copr": False, "tray": False, "autostart": False}
+    def _load_source_preferences(self) -> dict[str, bool | str]:
+        defaults = {
+            "flatpak": False,
+            "terra": False,
+            "copr": False,
+            "tray": False,
+            "autostart": False,
+            "navigation": "topnav",
+        }
         try:
             loaded = json.loads(self._source_settings_path.read_text())
         except (OSError, ValueError):
             return defaults
         if not isinstance(loaded, dict):
             return defaults
-        return {key: bool(loaded.get(key, value)) for key, value in defaults.items()}
+        preferences = {}
+        for key, value in defaults.items():
+            if key == "navigation":
+                selected = loaded.get(key, value)
+                preferences[key] = selected if selected in ("topnav", "sidebar") else value
+            else:
+                preferences[key] = bool(loaded.get(key, value))
+        return preferences
 
     @property
     def _autostart_path(self) -> Path:
@@ -471,13 +490,10 @@ class FedoraStore(Adw.Application):
         Gtk.StyleContext.add_provider_for_display(display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
 
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._root = root
         self.toast_overlay.set_child(root)
-        self._build_topnav(root)
+        self._build_shell(root)
         self.window.connect("notify::width", self._update_responsive_topbar)
-        self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        self.main_box.set_hexpand(True)
-        self.main_box.set_vexpand(True)
-        root.append(self.main_box)
 
         self._register_actions()
         self.render_page()
@@ -678,6 +694,111 @@ class FedoraStore(Adw.Application):
 
     # ---------- Navigation ----------
 
+    def _build_shell(self, root: Gtk.Box) -> None:
+        if self.navigation_mode == "sidebar":
+            content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+            content.set_hexpand(True)
+            content.set_vexpand(True)
+            root.append(content)
+            self._build_sidebar(content)
+            host = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            host.set_hexpand(True)
+            host.set_vexpand(True)
+            header = Gtk.Box()
+            header.set_margin_top(8)
+            header.set_margin_start(16)
+            header.set_margin_end(16)
+            spacer = Gtk.Box()
+            spacer.set_hexpand(True)
+            header.append(spacer)
+            header.append(self._close_button())
+            host.append(header)
+            content.append(host)
+        else:
+            self._build_topnav(root)
+            host = root
+        self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.main_box.set_hexpand(True)
+        self.main_box.set_vexpand(True)
+        host.append(self.main_box)
+        self._build_footer(root)
+
+    def _navigation_menu(self) -> Gio.Menu:
+        menu = Gio.Menu()
+        menu.append(_("Navegação superior"), "app.navigation-topnav")
+        menu.append(_("Barra lateral"), "app.navigation-sidebar")
+        return menu
+
+    def _logo_button(self) -> Gtk.MenuButton:
+        logo = Gtk.Image.new_from_file(str(LOGO_PATH))
+        logo.set_pixel_size(30)
+        button = Gtk.MenuButton(menu_model=self._navigation_menu())
+        button.set_child(logo)
+        button.add_css_class("flat")
+        button.set_tooltip_text(_("Escolher estilo de navegação"))
+        return button
+
+    def _close_button(self) -> Gtk.Button:
+        close = Gtk.Button(icon_name="window-close-symbolic")
+        close.add_css_class("flat")
+        close.set_tooltip_text(_("Fechar aplicativo"))
+        close.connect("clicked", self._close_window)
+        return close
+
+    def _settings_button(self) -> Gtk.Button:
+        settings = Gtk.Button(icon_name="emblem-system-symbolic")
+        settings.add_css_class("flat")
+        settings.set_tooltip_text(_("Configurações"))
+        settings.connect("clicked", lambda *_args: self.navigate("settings"))
+        return settings
+
+    def _build_footer(self, root: Gtk.Box) -> None:
+        footer = Gtk.Box()
+        footer.set_margin_start(16)
+        footer.set_margin_end(16)
+        footer.set_margin_bottom(8)
+        footer.append(self._settings_button())
+        root.append(footer)
+
+    def _build_sidebar(self, root: Gtk.Box) -> None:
+        self._topbar_tools = Gtk.Box(spacing=6)
+        rail = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        rail.add_css_class("fs-sidebar")
+        rail.set_size_request(72, -1)
+        rail.set_margin_top(12)
+        rail.set_margin_bottom(12)
+        rail.set_margin_start(10)
+        rail.set_margin_end(10)
+        rail.append(self._logo_button())
+        separator = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        separator.set_margin_top(4)
+        separator.set_margin_bottom(4)
+        rail.append(separator)
+        self._topnav_labels.clear()
+        self.sidebar_rows.clear()
+        first: Gtk.ToggleButton | None = None
+        for key, label, icon_name in SIDEBAR_ITEMS:
+            button = Gtk.ToggleButton()
+            button.set_name(key)
+            button.set_tooltip_text(label)
+            button.set_icon_name(icon_name)
+            button.add_css_class("fs-navbtn")
+            button.add_css_class("fs-sidebar-btn")
+            if first:
+                button.set_group(first)
+            else:
+                first = button
+            button.connect("clicked", self._nav_clicked, key)
+            if key == "copr":
+                button.set_visible(bool(self.third_party_sources["copr"]))
+            rail.append(button)
+            self.sidebar_rows[key] = button
+        spacer = Gtk.Box()
+        spacer.set_vexpand(True)
+        rail.append(spacer)
+        root.append(rail)
+        self._select_sidebar_row()
+
     def _build_topnav(self, root: Gtk.Box) -> None:
         topbar = Gtk.CenterBox()
         topbar.add_css_class("fs-topbar")
@@ -690,12 +811,12 @@ class FedoraStore(Adw.Application):
         brand = Gtk.Box(spacing=10)
         brand.set_margin_start(6)
         brand.set_tooltip_text(_("Aplicativos"))
-        icon = "preferences-desktop-apps-symbolic" if self._icon_available("preferences-desktop-apps-symbolic") else "application-x-executable-symbolic"
-        brand.append(Gtk.Image(icon_name=icon, pixel_size=20))
+        brand.append(self._logo_button())
         topbar.set_start_widget(brand)
 
         nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         self._topnav = nav
+        topbar.set_center_widget(nav)
         self._topnav_labels.clear()
         first: Gtk.ToggleButton | None = None
         for key, label, ic in SIDEBAR_ITEMS:
@@ -775,23 +896,7 @@ class FedoraStore(Adw.Application):
             search.set_width_chars(24)
             self._topbar_search = search
 
-        settings = Gtk.Button(icon_name="emblem-system-symbolic")
-        settings.add_css_class("flat")
-        settings.set_tooltip_text(_("Configurações"))
-        settings.set_sensitive(self.page != "settings")
-        settings.connect("clicked", lambda *_args: self.navigate("settings"))
-        self._topbar_tools.append(settings)
-
-        if uses_tiling_wm():
-            close = Gtk.Button(icon_name="window-close-symbolic")
-            close.add_css_class("flat")
-            close.set_tooltip_text(_("Fechar aplicativo"))
-            close.connect("clicked", self._close_window)
-            self._topbar_tools.append(close)
-        else:
-            controls = Gtk.WindowControls.new(Gtk.PackType.END)
-            controls.set_decoration_layout("minimize,maximize,close")
-            self._topbar_tools.append(controls)
+        self._topbar_tools.append(self._close_button())
         self._update_responsive_topbar()
 
     def _close_window(self, *_args: object) -> None:
@@ -804,6 +909,23 @@ class FedoraStore(Adw.Application):
         self._set_tray(True)
         self.window.hide()
         return True
+
+    def _set_navigation_mode(
+        self, _action: Gio.SimpleAction, _parameter: GLib.Variant | None, mode: str
+    ) -> None:
+        if mode == self.navigation_mode:
+            return
+        self.navigation_mode = mode
+        self.third_party_sources["navigation"] = mode
+        self._save_source_preferences()
+        if not self.toast_overlay:
+            return
+        root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self._root = root
+        self.toast_overlay.set_child(root)
+        self._build_shell(root)
+        self._update_responsive_topbar()
+        self.render_page()
 
     def _source_switch_state(self, switch: Gtk.Switch, state: bool, key: str) -> bool:
         if state == self.third_party_sources[key]:
@@ -941,7 +1063,7 @@ class FedoraStore(Adw.Application):
             subnav.add_css_class("fs-subnav")
             subnav.set_hexpand(True)
             self._topbar_search.set_halign(Gtk.Align.CENTER)
-            self._topbar_search.set_width_chars(24)
+            self._topbar_search.set_width_chars(30)
             subnav.append(self._topbar_search)
             self._topnav_subnav = subnav
             self.main_box.append(subnav)
@@ -1200,6 +1322,10 @@ class FedoraStore(Adw.Application):
 
     def _explore(self, body: Gtk.Box) -> None:
         controls = Gtk.Box(spacing=8)
+        controls.set_margin_top(4)
+        controls.set_margin_bottom(4)
+        controls.set_margin_start(64)
+        controls.set_margin_end(24)
         first: Gtk.ToggleButton | None = None
         for source, _key in CHIP_SOURCES:
             if source in ("Terra", "COPR", "Flatpak") and not self.third_party_sources[source.casefold()]:
@@ -1266,19 +1392,7 @@ class FedoraStore(Adw.Application):
                 callback=self._reload_data))
             return
         rows = self._featured_rows(data_rows[:self.featured_visible])
-        grid = Gtk.FlowBox()
-        grid.set_selection_mode(Gtk.SelectionMode.NONE)
-        grid.set_homogeneous(True)
-        grid.set_hexpand(True)
-        grid.set_halign(Gtk.Align.FILL)
-        grid.set_min_children_per_line(1)
-        grid.set_max_children_per_line(4)
-        grid.set_column_spacing(16)
-        grid.set_row_spacing(16)
-        grid.set_valign(Gtk.Align.START)
-        for package in rows:
-            grid.append(self._package_card(package))
-        body.append(grid)
+        body.append(self._package_view(rows))
         if self.featured_loading_more and self.featured_visible < len(data_rows):
             loader = Gtk.Box(spacing=8)
             loader.set_halign(Gtk.Align.CENTER)
@@ -1318,15 +1432,7 @@ class FedoraStore(Adw.Application):
                 icon="system-search-symbolic",
             ))
             return
-        grid = Gtk.FlowBox()
-        grid.set_selection_mode(Gtk.SelectionMode.NONE)
-        grid.set_homogeneous(True)
-        grid.set_hexpand(True)
-        grid.set_halign(Gtk.Align.FILL)
-        grid.set_min_children_per_line(1)
-        grid.set_max_children_per_line(4)
-        grid.set_column_spacing(16)
-        grid.set_row_spacing(16)
+        packages = []
         for row in rows:
             installed = self.flatpak_installed.get(row["flatpak_id"], {})
             package = Package(
@@ -1341,8 +1447,8 @@ class FedoraStore(Adw.Application):
                 flatpak_id=row["flatpak_id"],
                 icon_url=row["icon"],
             )
-            grid.append(self._package_card(package))
-        body.append(grid)
+            packages.append(package)
+        body.append(self._package_view(packages))
 
     def _explore_search(self, body: Gtk.Box) -> None:
         if self.search_pending and self.search_results is None:
@@ -1375,7 +1481,7 @@ class FedoraStore(Adw.Application):
             if total > 80:
                 cards = cards[:80]
             if cards:
-                body.append(self._package_list(cards))
+                body.append(self._package_view(cards))
             if total > 80:
                 note = Gtk.Label(label=_("Mostrando os {0} primeiros de {1} resultados — refine a busca.").format(len(cards), total), xalign=0, wrap=True)
                 note.add_css_class("dim-label")
@@ -1759,6 +1865,24 @@ class FedoraStore(Adw.Application):
         self._detail_packages[target] = package
         return target
 
+    def _package_grid(self, packages: list[Package]) -> Gtk.FlowBox:
+        grid = Gtk.FlowBox()
+        grid.set_selection_mode(Gtk.SelectionMode.NONE)
+        grid.set_homogeneous(True)
+        grid.set_hexpand(True)
+        grid.set_halign(Gtk.Align.FILL)
+        grid.set_min_children_per_line(1)
+        grid.set_max_children_per_line(4)
+        grid.set_column_spacing(16)
+        grid.set_row_spacing(16)
+        grid.set_valign(Gtk.Align.START)
+        for package in packages:
+            grid.append(self._package_card(package))
+        return grid
+
+    def _package_view(self, packages: list[Package]) -> Gtk.Widget:
+        return self._package_list(packages) if self.view_mode == "list" else self._package_grid(packages)
+
     def _package_card(self, package: Package) -> Gtk.Widget:
         card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         card.add_css_class("card")
@@ -1929,6 +2053,8 @@ class FedoraStore(Adw.Application):
         self._page_block(body, _("Aplicativos instalados"), _("Gerencie os pacotes presentes neste computador."))
 
         controls = Gtk.Box(spacing=10)
+        controls.set_margin_top(4)
+        controls.set_margin_bottom(4)
         sources = ["Todas", "Fedora", "Terra", "COPR"]
         dropdown_src = Gtk.DropDown.new_from_strings([_(s) for s in sources])
         dropdown_src.set_selected(min(self.installed_source, len(sources) - 1))
@@ -1957,6 +2083,7 @@ class FedoraStore(Adw.Application):
             package.icon = self._icon_for(package.name)
         listbox = Gtk.ListBox()
         listbox.set_selection_mode(Gtk.SelectionMode.NONE)
+        listbox.add_css_class("card")
         listbox.add_css_class("boxed-list")
         self.safe = True
         for package in packages:
@@ -2983,6 +3110,10 @@ class FedoraStore(Adw.Application):
         toggle_select = Gio.SimpleAction.new("toggle-select", GLib.VariantType.new("s"))
         toggle_select.connect("activate", self._act_toggle_select)
         self.window.add_action(toggle_select)
+        for name, mode in (("navigation-topnav", "topnav"), ("navigation-sidebar", "sidebar")):
+            navigation = Gio.SimpleAction.new(name, None)
+            navigation.connect("activate", self._set_navigation_mode, mode)
+            self.add_action(navigation)
 
     def _act_open_detail(self, _action: Gio.SimpleAction, variant: GLib.Variant) -> None:
         target = variant.unpack()

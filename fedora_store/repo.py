@@ -17,9 +17,11 @@ import re
 import shutil
 import subprocess
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 SEARCH_LINE = re.compile(r"^([\w.+-]+)\.([\w.]+)\t(.*)$")
@@ -29,6 +31,8 @@ COPR_AGENT = "fedora-store/1.0 (+https://github.com/fedastore)"
 FLATHUB_API = "https://flathub.org/api/v2"
 FLATHUB_REPO_URL = "https://dl.flathub.org/repo/flathub.flatpakrepo"
 TERRA_REPO_FILE = Path("/etc/yum.repos.d/terra.repo")
+_APPSTREAM_CACHE_TTL = 300
+_appstream_cache: dict[str, tuple[float, list[str]]] = {}
 
 
 def available_on_system() -> bool:
@@ -174,39 +178,48 @@ def _flathub_get(path: str, params: dict | None = None, timeout: int = 15):
 
 def _flathub_metadata(app_ids: list[str], limit: int, locale: str) -> list[dict]:
     """Fetch display metadata for a bounded set of Flathub application IDs."""
-    rows = []
-    for app_id in app_ids[:limit]:
+    def fetch(app_id: str) -> dict | None:
         if not isinstance(app_id, str):
-            continue
+            return None
         try:
             metadata = _flathub_get(f"/appstream/{urllib.parse.quote(app_id, safe='.')}", {"locale": locale})
         except Exception:
-            continue
+            return None
         if not isinstance(metadata, dict) or metadata.get("is_eol"):
-            continue
+            return None
         release = next(iter(metadata.get("releases") or []), {})
-        rows.append({
+        return {
             "flatpak_id": app_id,
             "name": str(metadata.get("name") or app_id),
             "summary": str(metadata.get("summary") or ""),
             "description": str(metadata.get("description") or ""),
             "version": str(release.get("version") or ""),
             "icon": str(metadata.get("icon") or "application-x-executable-symbolic"),
-        })
-    return rows
+        }
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        return [row for row in executor.map(fetch, app_ids[:limit]) if row is not None]
+
+
+def _flathub_appstream_ids(sort: str) -> list[str]:
+    now = time.monotonic()
+    cached = _appstream_cache.get(sort)
+    if cached and now - cached[0] < _APPSTREAM_CACHE_TTL:
+        return cached[1]
+    data = _flathub_get("/appstream", {"filter": "apps", "sort": sort})
+    app_ids = [item for item in data if isinstance(item, str)] if isinstance(data, list) else []
+    _appstream_cache[sort] = (now, app_ids)
+    return app_ids
 
 
 def flathub_catalog(limit: int = 48, locale: str = "pt-BR") -> list[dict]:
     """Return a bounded, recently updated set of Flathub application metadata."""
-    app_ids = _flathub_get("/appstream", {"filter": "apps", "sort": "last-updated-at"})
-    return _flathub_metadata(app_ids, limit, locale) if isinstance(app_ids, list) else []
+    return _flathub_metadata(_flathub_appstream_ids("last-updated-at"), limit, locale)
 
 
 def flathub_search(query: str, limit: int = 48, locale: str = "pt-BR") -> list[dict]:
     """Find Flathub apps by their canonical IDs, then fetch their display metadata."""
-    app_ids = _flathub_get("/appstream", {"filter": "apps", "sort": "alphabetical"})
-    if not isinstance(app_ids, list):
-        return []
+    app_ids = _flathub_appstream_ids("alphabetical")
     needle = query.casefold().strip()
     matches = [app_id for app_id in app_ids if isinstance(app_id, str) and needle in app_id.casefold()]
     return _flathub_metadata(matches, limit, locale)
