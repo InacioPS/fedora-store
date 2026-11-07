@@ -30,6 +30,7 @@ COPR_API = "https://copr.fedorainfracloud.org/api_3"
 COPR_AGENT = "fedora-store/1.0 (+https://github.com/fedastore)"
 FLATHUB_API = "https://flathub.org/api/v2"
 FLATHUB_REPO_URL = "https://dl.flathub.org/repo/flathub.flatpakrepo"
+GITHUB_RELEASES_URL = "https://api.github.com/repos/InacioPS/fedora-store/releases/latest"
 TERRA_REPO_FILE = Path("/etc/yum.repos.d/terra.repo")
 _APPSTREAM_CACHE_TTL = 300
 _appstream_cache: dict[str, tuple[float, list[str]]] = {}
@@ -248,6 +249,27 @@ def flatpak_installed() -> dict[str, dict]:
             "origin": values[1] if len(values) > 1 else "",
         }
     return rows
+
+
+def latest_release(timeout: int = 10) -> dict[str, str] | None:
+    """Return the latest public GitHub release without blocking the GTK thread."""
+    request = urllib.request.Request(
+        GITHUB_RELEASES_URL,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": COPR_AGENT},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (OSError, ValueError, urllib.error.URLError):
+        return None
+    tag = str(data.get("tag_name") or "").strip()
+    if not tag or data.get("draft") or data.get("prerelease"):
+        return None
+    return {
+        "tag": tag,
+        "version": tag.removeprefix("v"),
+        "url": str(data.get("html_url") or ""),
+    }
 
 
 def copr_search_projects(query: str, limit: int = 6) -> list[dict]:

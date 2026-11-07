@@ -43,6 +43,7 @@ install -Dpm0644 fedora_store/assets/fedora-store-logo.png \
 desktop-file-validate packaging/io.github.fedorastore.FedoraStore.desktop
 
 %files
+%license LICENSE.md
 %doc README.md
 %{_bindir}/fedora-store
 %{_datadir}/fedora-store/fedora_store/

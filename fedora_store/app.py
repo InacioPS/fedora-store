@@ -35,6 +35,7 @@ from fedora_store import repo  # noqa: E402
 from fedora_store.catalog import Package  # noqa: E402
 
 APP_ID = "io.github.fedorastore.FedoraStore"
+APP_VERSION = "0.1.0"
 _ = gettext.gettext
 
 SIDEBAR_ITEMS = [
@@ -154,6 +155,8 @@ class FedoraStore(Adw.Application):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
         self._background_start = background
         self._notification_sent = False
+        self._release_notification_sent = False
+        self.latest_release_info: dict[str, str] | None = None
         self._indicator = None
         self._background_hold = False
         self.connect("activate", self.on_activate)
@@ -476,6 +479,7 @@ class FedoraStore(Adw.Application):
         if self.window:
             self.window.present()
             self._load_initial()
+            self._check_latest_release()
             return
         self.window = Adw.ApplicationWindow(application=self, title=_("Aplicativos"))
         self.window.connect("close-request", self._close_requested)
@@ -504,6 +508,7 @@ class FedoraStore(Adw.Application):
         if self._background_start and self.third_party_sources["tray"]:
             self.window.hide()
         self._load_initial()
+        self._check_latest_release()
 
     def _icon_available(self, name: str) -> bool:
         if not self.window:
@@ -523,6 +528,40 @@ class FedoraStore(Adw.Application):
         return icon
 
     # ---------- data loading ----------
+
+    @staticmethod
+    def _version_key(version: str) -> tuple[int, ...]:
+        values = []
+        for part in version.removeprefix("v").split("."):
+            digits = "".join(character for character in part if character.isdigit())
+            values.append(int(digits or 0))
+        return tuple(values or [0])
+
+    def _check_latest_release(self) -> None:
+        def worker() -> None:
+            release = repo.latest_release()
+            GLib.idle_add(self._apply_latest_release, release)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _apply_latest_release(self, release: dict[str, str] | None) -> bool:
+        self.latest_release_info = release
+        if (
+            not release
+            or self._version_key(release["version"]) <= self._version_key(APP_VERSION)
+            or self._release_notification_sent
+        ):
+            return False
+        notification = Gio.Notification.new(_("Nova versão disponível"))
+        notification.set_body(
+            _("A versão {0} do Fedora Store está disponível no GitHub.").format(release["version"])
+        )
+        notification.set_default_action("app.activate")
+        self.send_notification("release-available", notification)
+        self._release_notification_sent = True
+        if self.page == "settings":
+            self.render_page()
+        return False
 
     def _load_initial(self) -> None:
         if self._core_loading:
@@ -2424,6 +2463,12 @@ class FedoraStore(Adw.Application):
             row.add_suffix(switch)
             behavior.append(row)
         body.append(behavior)
+
+        version = Gtk.Label(label=_("Fedora Store {0}").format(APP_VERSION), xalign=0)
+        version.add_css_class("dim-label")
+        version.add_css_class("fs-note")
+        version.set_margin_top(22)
+        body.append(version)
 
     def _sources(self, body: Gtk.Box) -> None:
         self._page_block(body, _("Fontes de aplicativos"), _("Repositórios configurados no DNF neste computador."))
