@@ -1,5 +1,5 @@
 Name:           fedora-store
-Version:        0.1.0
+Version:        0.1.1
 Release:        1%{?dist}
 Summary:        Loja de aplicativos para Fedora
 
@@ -51,5 +51,7 @@ desktop-file-validate packaging/io.github.fedorastore.FedoraStore.desktop
 %{_datadir}/icons/hicolor/128x128/apps/io.github.fedorastore.FedoraStore.png
 
 %changelog
+* Sat Nov 07 2026 Fedora Store contributors <maintainers@fedorastore.invalid> - 0.1.1-1
+- Atualizacao pela release do GitHub com botao na notificacao
 * Thu Nov 05 2026 Fedora Store contributors <maintainers@fedorastore.invalid> - 0.1.0-1
 - First RPM package

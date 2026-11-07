@@ -37,4 +37,4 @@ nix develop
 ./packaging/build-rpm.sh
 ```
 
-O artefato aparece em `.rpmbuild/RPMS/noarch/fedora-store-0.1.0-1.noarch.rpm`. O script cria um arquivo fonte limpo, força os caminhos Fedora (`/usr`) mesmo quando o `rpmbuild` vem do Nix e valida o arquivo `.desktop`.
+O artefato aparece em `.rpmbuild/RPMS/noarch/fedora-store-0.1.1-1.noarch.rpm`. O script cria um arquivo fonte limpo, força os caminhos Fedora (`/usr`) mesmo quando o `rpmbuild` vem do Nix e valida o arquivo `.desktop`.

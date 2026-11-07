@@ -36,7 +36,7 @@ from fedora_store import repo  # noqa: E402
 from fedora_store.catalog import Package  # noqa: E402
 
 APP_ID = "io.github.fedorastore.FedoraStore"
-APP_VERSION = "0.1.0"
+APP_VERSION = "0.1.1"
 _ = gettext.gettext
 
 SIDEBAR_ITEMS = [
