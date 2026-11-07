@@ -11,15 +11,25 @@ operations run through polkit (pkexec).
 from __future__ import annotations
 
 import gettext
+from datetime import datetime
+import json
 import os
+import shlex
 import sys
 import threading
+from pathlib import Path
 
 import gi
 
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+gi.require_version("GdkPixbuf", "2.0")
+
+LOGO_PATH = Path(__file__).with_name("assets") / "fedora-store-logo.png"
+TRAY_ICON_NAME = "io.github.fedorastore.FedoraStore"
+TRAY_OBJECT_PATH = "/StatusNotifierItem"
+TRAY_MENU_PATH = "/StatusNotifierMenu"
+from gi.repository import Adw, Gdk, GdkPixbuf, Gio, GLib, Gtk, Pango  # noqa: E402
 
 from fedora_store import repo  # noqa: E402
 from fedora_store.catalog import Package  # noqa: E402
@@ -33,6 +43,7 @@ SIDEBAR_ITEMS = [
     ("updates", _("Atualizações"), "software-update-available-symbolic"),
     ("copr", _("COPR"), "folder-remote-symbolic"),
     ("sources", _("Fontes"), "folder-publicshare-symbolic"),
+    ("local", _("RPM local"), "package-x-generic-symbolic"),
 ]
 
 HEADER_TITLES = {
@@ -41,14 +52,16 @@ HEADER_TITLES = {
     "updates": _("Atualizações"),
     "copr": _("COPR"),
     "sources": _("Fontes"),
+    "settings": _("Configurações"),
+    "local": _("RPM local"),
 }
 
 CHIP_SOURCES = [
     ("Todos", None),
-    ("Instalados", "installed"),
     ("DNF", "Fedora"),
     ("Terra", "Terra"),
     ("COPR", "COPR"),
+    ("Flatpak", "Flatpak"),
 ]
 
 SOURCES_DROPDOWN = ["Todas", "Fedora", "Terra", "COPR"]
@@ -56,13 +69,14 @@ SOURCES_DROPDOWN = ["Todas", "Fedora", "Terra", "COPR"]
 STYLE = b"""
 .fs-header-title { font-weight: 700; font-size: 16px; }
 .fs-topbar { border-bottom: 1px solid rgba(0, 0, 0, 0.07); }
-.fs-navbtn { font-weight: 600; border-width: 0px; background: none; color: #4A5158; padding: 8px 16px; min-height: 34px; border-radius: 999px; }
+.fs-subnav { padding: 0 24px 8px; border-bottom: 1px solid rgba(0, 0, 0, 0.07); }
+.fs-navbtn { font-weight: 600; border-width: 0px; background: none; color: #4A5158; padding: 5px 12px; min-height: 30px; border-radius: 999px; }
 .fs-navbtn:hover:not(:checked) { background: rgba(0, 0, 0, 0.06); }
 .fs-navbtn:checked { background: #D5E5FA; color: #205A9F; font-weight: 700; }
 .fs-heading { font-size: 32px; font-weight: 800; }
 .fs-page-title { font-size: 21px; font-weight: 700; }
 .fs-name { font-weight: 700; font-size: 17px; }
-.fs-search { min-height: 46px; font-size: 15px; }
+.fs-search { min-height: 38px; padding: 0 10px; font-size: 15px; }
 .fs-chip { font-weight: 600; border-width: 0px; background: none; color: #555C63; padding: 5px 14px; border-radius: 8px; }
 .fs-chip:hover:not(:checked) { background: rgba(0, 0, 0, 0.05); }
 .fs-chip:checked { background: #D8E8FA; color: #245EA3; font-weight: 700; }
@@ -77,6 +91,7 @@ STYLE = b"""
 .fs-danger-softbtn:hover { background: #EDD5D3; }
 .fs-dangerlink { background: none; border-width: 0px; color: #A33A37; font-weight: 700; }
 .fs-pillbtn { border-radius: 8px; min-height: 36px; padding: 0 20px; }
+.fs-package-action { min-width: 96px; }
 .fs-linkbtn { background: none; border-width: 0px; color: #2769B4; font-weight: 700; min-height: 32px; padding: 0 10px; border-radius: 8px; }
 .fs-linkbtn:hover { background: rgba(0, 0, 0, 0.05); }
 .fs-kicker { font-size: 12px; font-weight: 700; color: #70777C; }
@@ -84,6 +99,7 @@ STYLE = b"""
 .fs-origin-dnf { color: #577087; }
 .fs-origin-terra { color: #577087; }
 .fs-origin-copr { color: #8A6A3C; }
+.fs-origin-flatpak { color: #2F7DB2; }
 .fs-status-ok { color: #287253; font-weight: 600; }
 .fs-status-off { color: #9BA0A5; font-weight: 600; }
 .fs-banner { background: #FFF3D9; border-radius: 10px; }
@@ -94,6 +110,18 @@ STYLE = b"""
 .fs-dim-icon { color: #9BA0A5; }
 .fs-progress trough { min-height: 8px; border-radius: 4px; }
 .fs-note { font-size: 14px; }
+.fs-copr-table { border-radius: 12px; }
+.fs-copr-table-header { min-height: 36px; }
+.fs-copr-table-header-label { font-size: 12px; font-weight: 700; color: #7D858C; }
+.fs-copr-table-row { min-height: 44px; }
+.fs-copr-package { font-weight: 700; font-size: 15px; }
+.fs-copr-value { font-size: 14px; }
+.fs-copr-status { padding: 0; font-size: 12px; font-weight: 700; }
+.fs-copr-status-ok { background: none; color: #319268; }
+.fs-copr-status-failed { background: none; color: #C9504C; }
+.fs-copr-status-running { background: none; color: #B88940; }
+.fs-rpm-drop { padding: 28px 20px; }
+.fs-rpm-install { min-width: 84px; min-height: 30px; padding: 0 10px; }
 """
 
 TILING_WM_MARKERS = (
@@ -120,11 +148,16 @@ def uses_tiling_wm() -> bool:
 
 
 class FedoraStore(Adw.Application):
-    def __init__(self) -> None:
+    def __init__(self, *, background: bool = False) -> None:
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.DEFAULT_FLAGS)
+        self._background_start = background
+        self._notification_sent = False
+        self._indicator = None
+        self._background_hold = False
         self.connect("activate", self.on_activate)
         self.page = "explore"
         self.detail_package: Package | None = None
+        self._detail_packages: dict[str, Package] = {}
         self.safe = False
         self.busy = False
         self._busy_summary = ""
@@ -133,7 +166,8 @@ class FedoraStore(Adw.Application):
         self.view_mode = "grid"
         self.sort_mode = 0
         self.query_installed = ""
-        self.installed_source = 0
+        self.query_updates = ""
+        self.query_sources = ""
         self.copr_query = ""
         self.selected: set[str] = set()
         self.window: Adw.ApplicationWindow | None = None
@@ -141,12 +175,39 @@ class FedoraStore(Adw.Application):
         self.main_box: Gtk.Box | None = None
         self.sidebar_rows: dict[str, Gtk.ToggleButton] = {}
         self.updates_badge: Gtk.Label | None = None
+        self._topbar_search: Gtk.SearchEntry | None = None
+        self._topnav_subnav: Gtk.Box | None = None
+        self._topnav_labels: list[tuple[Gtk.Label, Gtk.Label | None]] = []
+        self._topnav: Gtk.Box | None = None
 
         self.packages_installed: dict[str, dict] = {}
         self.packages_upgrades: list[dict] = []
         self.packages_featured: list[dict] = []
+        self._featured_view_key: tuple[str, int] | None = None
+        self._featured_view_rows: list[dict] = []
+        self.featured_visible = 48
+        self.featured_loading_more = False
+        self._catalog_scroller: Gtk.ScrolledWindow | None = None
+        self._catalog_scroll_y = 0.0
+        self.flatpak_rows: list[dict] = []
+        self.flatpak_installed: dict[str, dict] = {}
+        self._flatpak_icon_cache: dict[str, Gdk.Texture] = {}
+        self._flatpak_icon_widgets: dict[str, list[Gtk.Image]] = {}
+        self._flatpak_icon_pending: set[str] = set()
+        self.flatpak_ready = False
+        self.flatpak_loading = False
+        self.flatpak_search_rows: list[dict] | None = None
+        self.flatpak_search_query = ""
+        self.flatpak_search_loading = False
+        self.flatpak_search_token = 0
+        self._source_settings_path = Path(GLib.get_user_config_dir()) / "fedora-store" / "sources.json"
+        self.third_party_sources = self._load_source_preferences()
         self.repos: list[dict] = []
+        self.local_rpm: dict[str, str] | None = None
+        self.local_rpm_detail = False
+        self.local_rpm_loading = False
         self.ready = False
+        self._core_loading = False
         self.featured_ready = False
         self.search_token = 0
         self.search_pending = False
@@ -160,31 +221,247 @@ class FedoraStore(Adw.Application):
         self._detail_pending: set[str] = set()
         self._detail_info: dict[str, tuple] = {}
         self._detail_failed: set[str] = set()
-        # Copr APIv3 search (public, no authentication)
-        self.copr_search_token = 0
-        self.copr_search_pending = False
-        self.copr_search_data: dict | None = None
-        self.copr_search_failed = False
         self.copr_projects_token = 0
         self.copr_projects_pending = False
         self.copr_projects_data: list[dict] | None = None
         self.copr_projects_failed = False
+        self.copr_package_project: tuple[str, str, str] | None = None
+        self._copr_project_packages: dict[str, list[dict]] = {}
+        self._copr_project_packages_loading: set[str] = set()
+        self._copr_project_packages_failed: set[str] = set()
         self._copr_expanded: dict[str, dict] = {}
         self._copr_loading: set[str] = set()
         self._copr_rows: dict[str, Adw.ExpanderRow] = {}
+
+    def _load_source_preferences(self) -> dict[str, bool]:
+        defaults = {"flatpak": False, "terra": False, "copr": False, "tray": False, "autostart": False}
+        try:
+            loaded = json.loads(self._source_settings_path.read_text())
+        except (OSError, ValueError):
+            return defaults
+        if not isinstance(loaded, dict):
+            return defaults
+        return {key: bool(loaded.get(key, value)) for key, value in defaults.items()}
+
+    @property
+    def _autostart_path(self) -> Path:
+        return Path(GLib.get_user_config_dir()) / "autostart" / "fedora-store.desktop"
+
+    def _set_autostart(self, enabled: bool) -> None:
+        path = self._autostart_path
+        if not enabled:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                self._toast(_("Não foi possível remover a inicialização automática."))
+            return
+        command = shlex.join([sys.executable, "-m", "fedora_store", "--background"])
+        content = "\n".join((
+            "[Desktop Entry]",
+            "Type=Application",
+            "Name=Aplicativos",
+            f"Exec={command}",
+            f"Icon={LOGO_PATH}",
+            "X-GNOME-Autostart-enabled=true",
+            "",
+        ))
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        except OSError:
+            self._toast(_("Não foi possível configurar a inicialização automática."))
+
+    def _set_background_hold(self, enabled: bool) -> None:
+        if enabled and not self._background_hold:
+            self.hold()
+            self._background_hold = True
+        elif not enabled and self._background_hold:
+            self.release()
+            self._background_hold = False
+
+    def _install_tray_icon(self) -> Path:
+        icon_path = Path(GLib.get_user_data_dir()) / "icons" / "hicolor" / "64x64" / "apps" / f"{TRAY_ICON_NAME}.png"
+        icon_path.parent.mkdir(parents=True, exist_ok=True)
+        if not icon_path.exists() or icon_path.stat().st_mtime < LOGO_PATH.stat().st_mtime:
+            image = GdkPixbuf.Pixbuf.new_from_file_at_scale(str(LOGO_PATH), 64, 64, True)
+            image.savev(str(icon_path), "png", [], [])
+        return icon_path
+
+    def _tray_method_call(self, _connection, _sender, _path, _interface, method, _parameters, invocation) -> None:
+        if method in ("Activate", "SecondaryActivate") and self.window:
+            self.window.present()
+        invocation.return_value(GLib.Variant("()", ()))
+
+    def _tray_menu_item(self, item_id: int, label: str | None = None) -> GLib.Variant:
+        attributes = {
+            "visible": GLib.Variant("b", True),
+            "enabled": GLib.Variant("b", True),
+        }
+        if label is None:
+            attributes["type"] = GLib.Variant("s", "separator")
+        else:
+            attributes["label"] = GLib.Variant("s", label)
+        return GLib.Variant("(ia{sv}av)", (item_id, attributes, []))
+
+    def _tray_menu_layout(self) -> GLib.Variant:
+        children = [
+            GLib.Variant("v", self._tray_menu_item(1, _("Abrir"))),
+            GLib.Variant("v", self._tray_menu_item(2, _("Atualizar sistema"))),
+            GLib.Variant("v", self._tray_menu_item(3)),
+            GLib.Variant("v", self._tray_menu_item(4, _("Fechar aplicativo"))),
+        ]
+        root = GLib.Variant(
+            "(ia{sv}av)",
+            (0, {"children-display": GLib.Variant("s", "submenu")}, children),
+        )
+        return GLib.Variant.new_tuple(GLib.Variant("u", 1), root)
+
+    def _tray_menu_method_call(self, _connection, _sender, _path, _interface, method, parameters, invocation) -> None:
+        if method == "GetLayout":
+            invocation.return_value(self._tray_menu_layout())
+            return
+        if method == "AboutToShow":
+            invocation.return_value(GLib.Variant("(b)", (False,)))
+            return
+        if method == "Event":
+            item_id, event, _data, _timestamp = parameters.unpack()
+            if event == "clicked":
+                GLib.idle_add(self._run_tray_action, item_id)
+            invocation.return_value(GLib.Variant("()", ()))
+
+    def _run_tray_action(self, item_id: int) -> bool:
+        if item_id == 1 and self.window:
+            self.window.present()
+        elif item_id == 2:
+            if self.window:
+                self.window.present()
+            self._update_all()
+        elif item_id == 4:
+            self._set_tray(False)
+            if self.window:
+                self.window.destroy()
+            self.quit()
+        return False
+
+    def _tray_get_property(self, _connection, _sender, _path, _interface, name: str) -> GLib.Variant | None:
+        values = {
+            "Category": GLib.Variant("s", "ApplicationStatus"),
+            "Id": GLib.Variant("s", APP_ID),
+            "Title": GLib.Variant("s", _("Aplicativos")),
+            "Status": GLib.Variant("s", "Active"),
+            "IconName": GLib.Variant("s", TRAY_ICON_NAME),
+            "IconThemePath": GLib.Variant("s", str(Path(GLib.get_user_data_dir()) / "icons")),
+            "ItemIsMenu": GLib.Variant("b", False),
+            "Menu": GLib.Variant("o", TRAY_MENU_PATH),
+        }
+        return values.get(name)
+
+    @staticmethod
+    def _tray_menu_get_property(_connection, _sender, _path, _interface, name: str) -> GLib.Variant | None:
+        values = {
+            "Version": GLib.Variant("u", 4),
+            "TextDirection": GLib.Variant("s", "ltr"),
+            "Status": GLib.Variant("s", "normal"),
+            "IconThemePath": GLib.Variant("as", []),
+        }
+        return values.get(name)
+
+    def _set_tray(self, enabled: bool) -> bool:
+        if not enabled:
+            if self._indicator is not None:
+                connection, registration, menu_registration = self._indicator
+                connection.unregister_object(registration)
+                connection.unregister_object(menu_registration)
+                self._indicator = None
+            self._set_background_hold(False)
+            return True
+        if self._indicator is not None:
+            self._set_background_hold(True)
+            return True
+        try:
+            self._install_tray_icon()
+            connection = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            node = Gio.DBusNodeInfo.new_for_xml(
+                "<node><interface name='org.kde.StatusNotifierItem'>"
+                "<method name='Activate'><arg type='i' direction='in'/><arg type='i' direction='in'/></method>"
+                "<method name='SecondaryActivate'><arg type='i' direction='in'/><arg type='i' direction='in'/></method>"
+                "<method name='ContextMenu'><arg type='i' direction='in'/><arg type='i' direction='in'/></method>"
+                "<property name='Category' type='s' access='read'/><property name='Id' type='s' access='read'/>"
+                "<property name='Title' type='s' access='read'/><property name='Status' type='s' access='read'/>"
+                "<property name='IconName' type='s' access='read'/><property name='IconThemePath' type='s' access='read'/>"
+                "<property name='ItemIsMenu' type='b' access='read'/><property name='Menu' type='o' access='read'/></interface></node>"
+            )
+            registration = connection.register_object(
+                TRAY_OBJECT_PATH, node.interfaces[0], self._tray_method_call, self._tray_get_property, None,
+            )
+            menu_node = Gio.DBusNodeInfo.new_for_xml(
+                "<node><interface name='com.canonical.dbusmenu'>"
+                "<method name='GetLayout'><arg type='i' direction='in'/><arg type='i' direction='in'/><arg type='as' direction='in'/><arg type='u' direction='out'/><arg type='(ia{sv}av)' direction='out'/></method>"
+                "<method name='Event'><arg type='i' direction='in'/><arg type='s' direction='in'/><arg type='v' direction='in'/><arg type='u' direction='in'/></method>"
+                "<method name='AboutToShow'><arg type='i' direction='in'/><arg type='b' direction='out'/></method>"
+                "<property name='Version' type='u' access='read'/><property name='TextDirection' type='s' access='read'/>"
+                "<property name='Status' type='s' access='read'/><property name='IconThemePath' type='as' access='read'/>"
+                "</interface></node>"
+            )
+            menu_registration = connection.register_object(
+                TRAY_MENU_PATH, menu_node.interfaces[0], self._tray_menu_method_call, self._tray_menu_get_property, None,
+            )
+            connection.call(
+                "org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher",
+                "org.kde.StatusNotifierWatcher", "RegisterStatusNotifierItem",
+                GLib.Variant("(s)", (APP_ID,)), None, Gio.DBusCallFlags.NONE, -1, None, None, None,
+            )
+            self._indicator = (connection, registration, menu_registration)
+            self._set_background_hold(True)
+            return True
+        except Exception:
+            self._toast(_("Não foi possível criar o ícone na bandeja."))
+            return False
+
+    def _background_switch_state(self, switch: Gtk.Switch, state: bool, key: str) -> bool:
+        if state == self.third_party_sources[key]:
+            return True
+        if key == "tray":
+            if not self._set_tray(state):
+                switch.set_active(False)
+                return True
+            if not state and self.third_party_sources["autostart"]:
+                self.third_party_sources["autostart"] = False
+                self._set_autostart(False)
+        elif state and not self.third_party_sources["tray"]:
+            if not self._set_tray(True):
+                switch.set_active(False)
+                return True
+            self.third_party_sources["tray"] = True
+        self.third_party_sources[key] = state
+        self._save_source_preferences()
+        if key == "autostart":
+            self._set_autostart(state)
+        switch.set_active(state)
+        if self.page == "settings":
+            self.render_page()
+        return True
+
+    def _save_source_preferences(self) -> None:
+        try:
+            self._source_settings_path.parent.mkdir(parents=True, exist_ok=True)
+            self._source_settings_path.write_text(json.dumps(self.third_party_sources))
+        except OSError:
+            self._toast(_("Não foi possível salvar as preferências de fontes."))
 
     # ---------- boot ----------
 
     def on_activate(self, _app: Adw.Application) -> None:
         if self.window:
             self.window.present()
+            self._load_initial()
             return
         self.window = Adw.ApplicationWindow(application=self, title=_("Aplicativos"))
+        self.window.connect("close-request", self._close_requested)
         self.window.set_default_size(1440, 900)
-        self.window.set_size_request(780, 560)
         Adw.StyleManager.get_default().set_color_scheme(Adw.ColorScheme.DEFAULT)
-        if uses_tiling_wm() and (settings := Gtk.Settings.get_default()):
-            settings.set_property("gtk-decoration-layout", ":close")
         self.toast_overlay = Adw.ToastOverlay()
         self.window.set_content(self.toast_overlay)
 
@@ -196,6 +473,7 @@ class FedoraStore(Adw.Application):
         root = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.toast_overlay.set_child(root)
         self._build_topnav(root)
+        self.window.connect("notify::width", self._update_responsive_topbar)
         self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         self.main_box.set_hexpand(True)
         self.main_box.set_vexpand(True)
@@ -203,7 +481,12 @@ class FedoraStore(Adw.Application):
 
         self._register_actions()
         self.render_page()
+        self._update_responsive_topbar()
         self.window.present()
+        if self.third_party_sources["tray"]:
+            self._set_tray(True)
+        if self._background_start and self.third_party_sources["tray"]:
+            self.window.hide()
         self._load_initial()
 
     def _icon_available(self, name: str) -> bool:
@@ -226,12 +509,21 @@ class FedoraStore(Adw.Application):
     # ---------- data loading ----------
 
     def _load_initial(self) -> None:
+        if self._core_loading:
+            return
+        self._core_loading = True
+
         def core_worker():
+            refresh_error = ""
             try:
                 installed_rows = repo.installed()
-                upgrade_rows = repo.upgrades()
+                try:
+                    upgrade_rows = repo.refresh_upgrades()
+                except Exception as error:
+                    refresh_error = str(error)
+                    upgrade_rows = repo.upgrades()
                 repos_rows = repo.repos()
-                GLib.idle_add(self._apply_core, installed_rows, upgrade_rows, repos_rows)
+                GLib.idle_add(self._apply_core, installed_rows, upgrade_rows, repos_rows, refresh_error)
             except Exception as error:
                 GLib.idle_add(self._core_failed, error)
 
@@ -240,27 +532,41 @@ class FedoraStore(Adw.Application):
                 rows = repo.available_all()
             except Exception:
                 rows = []
-            for summary in []:
-                pass
-            results = repo.fancy_app_filter(rows) if rows else []
+            results = repo.fancy_app_filter(rows, limit=None) if rows else []
             GLib.idle_add(self._apply_featured, results)
 
         threading.Thread(target=core_worker, daemon=True).start()
         threading.Thread(target=featured_worker, daemon=True).start()
 
-    def _apply_core(self, installed_rows, upgrade_rows, repos_rows) -> bool:
+    def _apply_core(self, installed_rows, upgrade_rows, repos_rows, refresh_error: str = "") -> bool:
+        self._core_loading = False
         if installed_rows or not self.packages_installed:
             self.packages_installed = {row["name"]: row for row in installed_rows}
         if upgrade_rows or not self.packages_upgrades:
             self.packages_upgrades = list(upgrade_rows)
         if repos_rows or not self.repos:
             self.repos = list(repos_rows)
+        self._featured_view_key = None
+        self._featured_view_rows = []
         self.ready = True
         self._update_badge()
         self.render_page()
+        if self._background_start and self.packages_upgrades and not self._notification_sent:
+            count = len(self.packages_upgrades)
+            notification = Gio.Notification.new(_("Atualizações disponíveis"))
+            notification.set_body(
+                _("Há 1 atualização disponível.") if count == 1
+                else _("{0} atualizações estão disponíveis.").format(count)
+            )
+            notification.set_default_action("app.activate")
+            self.send_notification("updates-available", notification)
+            self._notification_sent = True
+        if refresh_error:
+            self._toast(_("Não foi possível verificar atualizações novas; exibindo o cache do DNF."))
         return False
 
     def _core_failed(self, error) -> bool:
+        self._core_loading = False
         self.ready = True
         self._update_badge()
         self.render_page()
@@ -269,8 +575,63 @@ class FedoraStore(Adw.Application):
 
     def _apply_featured(self, results) -> bool:
         self.packages_featured = results
+        self._featured_view_key = None
+        self._featured_view_rows = []
+        self.featured_visible = 48
+        self.featured_loading_more = False
         self.featured_ready = True
         if self.page == "explore" and not self.detail_package:
+            self.render_page()
+        return False
+
+    def _load_flatpak_catalog(self) -> None:
+        if self.flatpak_loading or self.flatpak_ready:
+            return
+        self.flatpak_loading = True
+
+        def worker() -> None:
+            try:
+                rows = repo.flathub_catalog()
+                installed = repo.flatpak_installed()
+            except Exception:
+                rows, installed = [], {}
+            GLib.idle_add(self._finish_flatpak_catalog, rows, installed)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_flatpak_catalog(self, rows: list[dict], installed: dict[str, dict]) -> bool:
+        self.flatpak_rows = rows
+        self.flatpak_installed = installed
+        self.flatpak_loading = False
+        self.flatpak_ready = True
+        if self.page == "explore" and self.filter_source == "Flatpak":
+            self.render_page()
+        return False
+
+    def _begin_flatpak_search(self, query: str) -> None:
+        """Search the complete Flathub AppStream index off the GTK thread."""
+        self.flatpak_search_token += 1
+        token = self.flatpak_search_token
+        self.flatpak_search_query = query.casefold()
+        self.flatpak_search_rows = None
+        self.flatpak_search_loading = True
+        self.render_page()
+
+        def worker() -> None:
+            try:
+                rows = repo.flathub_search(query)
+            except Exception:
+                rows = []
+            GLib.idle_add(self._finish_flatpak_search, token, rows)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_flatpak_search(self, token: int, rows: list[dict]) -> bool:
+        if token != self.flatpak_search_token:
+            return False
+        self.flatpak_search_rows = rows
+        self.flatpak_search_loading = False
+        if self.page == "explore" and self.filter_source == "Flatpak":
             self.render_page()
         return False
 
@@ -278,7 +639,7 @@ class FedoraStore(Adw.Application):
         count = self._updates_count()
         if self.updates_badge:
             self.updates_badge.set_text(str(count))
-            self.updates_badge.set_visible(count > 0)
+            self.updates_badge.set_visible(count > 0 and not self._topbar_compact)
 
     def _updates_count(self) -> int:
         return len(self.packages_upgrades)
@@ -315,7 +676,7 @@ class FedoraStore(Adw.Application):
             package = Package(name=name, summary=summary, icon=self._icon_for(name))
         return package
 
-    # ---------- Sidebar ----------
+    # ---------- Navigation ----------
 
     def _build_topnav(self, root: Gtk.Box) -> None:
         topbar = Gtk.CenterBox()
@@ -328,26 +689,14 @@ class FedoraStore(Adw.Application):
 
         brand = Gtk.Box(spacing=10)
         brand.set_margin_start(6)
+        brand.set_tooltip_text(_("Aplicativos"))
         icon = "preferences-desktop-apps-symbolic" if self._icon_available("preferences-desktop-apps-symbolic") else "application-x-executable-symbolic"
         brand.append(Gtk.Image(icon_name=icon, pixel_size=20))
-        brand_label = Gtk.Label(label=_("Aplicativos"), xalign=0)
-        brand_label.add_css_class("title-4")
-        brand.append(brand_label)
         topbar.set_start_widget(brand)
 
-        # Invisible mirror of the brand keeps the centered nav optically centered.
-        mirror = Gtk.Box(spacing=10)
-        mirror.set_margin_start(6)
-        mirror.append(Gtk.Image(icon_name=icon, pixel_size=20))
-        mirror_label = Gtk.Label(label=_("Aplicativos"), xalign=0)
-        mirror_label.add_css_class("title-4")
-        mirror.append(mirror_label)
-        mirror.set_opacity(0.0)
-        topbar.set_end_widget(mirror)
-
         nav = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        topbar.set_center_widget(nav)
-
+        self._topnav = nav
+        self._topnav_labels.clear()
         first: Gtk.ToggleButton | None = None
         for key, label, ic in SIDEBAR_ITEMS:
             btn = Gtk.ToggleButton()
@@ -357,13 +706,16 @@ class FedoraStore(Adw.Application):
             content.append(Gtk.Image(
                 icon_name=ic if self._icon_available(ic) else "application-x-executable-symbolic",
                 pixel_size=16))
-            content.append(Gtk.Label(label=label))
+            label_widget = Gtk.Label(label=label)
+            content.append(label_widget)
+            badge: Gtk.Label | None = None
             if key == "updates":
                 badge = Gtk.Label(label=str(self._updates_count()))
                 badge.add_css_class("dim-label")
                 badge.set_visible(self._updates_count() > 0)
                 content.append(badge)
                 self.updates_badge = badge
+            self._topnav_labels.append((label_widget, badge))
             btn.set_child(content)
             btn.add_css_class("fs-navbtn")
             if first:
@@ -371,14 +723,161 @@ class FedoraStore(Adw.Application):
             else:
                 first = btn
             btn.connect("clicked", self._nav_clicked, key)
+            if key == "copr":
+                btn.set_visible(self.third_party_sources["copr"])
             nav.append(btn)
             self.sidebar_rows[key] = btn
+
+        self._topbar_tools = Gtk.Box(spacing=6)
+        self._topbar_tools.set_halign(Gtk.Align.END)
+        topbar.set_end_widget(self._topbar_tools)
+        self._refresh_topbar_search()
         self._select_sidebar_row()
+
+    def _update_responsive_topbar(self, *_args: object) -> bool:
+        if not self.window:
+            return False
+        width = self.window.get_width()
+        compact = width < 1100
+        very_compact = width < 860
+        self._topbar_compact = compact
+        for label, badge in self._topnav_labels:
+            label.set_visible(not compact)
+            if badge:
+                badge.set_visible(not compact and self._updates_count() > 0)
+        if self._topnav:
+            self._topnav.set_spacing(3 if compact else 6)
+        if self._topbar_tools:
+            self._topbar_tools.set_spacing(3 if compact else 6)
+        if self._topbar_search:
+            self._topbar_search.set_width_chars(16 if very_compact else 22 if compact else 30)
+        return False
+
+    def _refresh_topbar_search(self) -> None:
+        if self._topbar_search:
+            search_parent = self._topbar_search.get_parent()
+            if search_parent:
+                search_parent.remove(self._topbar_search)
+        self._clear(self._topbar_tools)
+        self._search_entries.clear()
+        self._topbar_search = None
+        search_config = {
+            "explore": (_("Buscar pacotes nos repositórios"), "query"),
+            "installed": (_("Buscar aplicativos instalados"), "query_installed"),
+            "updates": (_("Buscar atualizações"), "query_updates"),
+            "copr": (_("Buscar projetos COPR na API"), "copr_query"),
+            "sources": (_("Buscar fontes de aplicativos"), "query_sources"),
+        }.get(self.page)
+        if search_config:
+            placeholder, attr = search_config
+            search = self._search_entry(placeholder, attr)
+            search.add_css_class("fs-topbar-search")
+            search.set_width_chars(24)
+            self._topbar_search = search
+
+        settings = Gtk.Button(icon_name="emblem-system-symbolic")
+        settings.add_css_class("flat")
+        settings.set_tooltip_text(_("Configurações"))
+        settings.set_sensitive(self.page != "settings")
+        settings.connect("clicked", lambda *_args: self.navigate("settings"))
+        self._topbar_tools.append(settings)
+
+        if uses_tiling_wm():
+            close = Gtk.Button(icon_name="window-close-symbolic")
+            close.add_css_class("flat")
+            close.set_tooltip_text(_("Fechar aplicativo"))
+            close.connect("clicked", self._close_window)
+            self._topbar_tools.append(close)
+        else:
+            controls = Gtk.WindowControls.new(Gtk.PackType.END)
+            controls.set_decoration_layout("minimize,maximize,close")
+            self._topbar_tools.append(controls)
+        self._update_responsive_topbar()
+
+    def _close_window(self, *_args: object) -> None:
+        if self.window:
+            self.window.close()
+
+    def _close_requested(self, _window: Adw.ApplicationWindow) -> bool:
+        if not self.third_party_sources["tray"]:
+            return False
+        self._set_tray(True)
+        self.window.hide()
+        return True
+
+    def _source_switch_state(self, switch: Gtk.Switch, state: bool, key: str) -> bool:
+        if state == self.third_party_sources[key]:
+            return True
+        if not state or key == "copr":
+            self._set_source_preference(key, state)
+            switch.set_active(state)
+            return True
+        switch.set_sensitive(False)
+        if key == "flatpak":
+            args = [
+                "pkexec", "flatpak", "remote-add", "--if-not-exists", "--system",
+                "flathub", repo.FLATHUB_REPO_URL,
+            ]
+        else:
+            if repo.terra_configured():
+                args = [
+                    "pkexec", "dnf", "config-manager", "setopt",
+                    "terra.enabled=1", "terra-source.enabled=1",
+                ]
+            else:
+                args = [
+                    "pkexec", "dnf", "config-manager", "addrepo",
+                    "--from-repofile=https://github.com/terrapkg/subatomic-repos/raw/main/terra.repo",
+                ]
+        self._toast(_("Aguarde a autorização do sistema para ativar a fonte."))
+
+        def worker() -> None:
+            try:
+                result = repo.subprocess_(args, timeout=900)
+                error = "" if result.returncode == 0 else (result.stderr or result.stdout or "").strip()[-160:]
+            except Exception as exception:
+                error = str(exception)[:160]
+            GLib.idle_add(self._finish_source_enable, key, switch, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def _finish_source_enable(self, key: str, switch: Gtk.Switch, error: str) -> bool:
+        switch.set_sensitive(True)
+        if error:
+            self._toast(_("Não foi possível ativar a fonte: {0}").format(error or _("erro desconhecido")))
+            return False
+        self._set_source_preference(key, True)
+        switch.set_active(True)
+        return False
+
+    def _set_source_preference(self, key: str, enabled: bool) -> None:
+        self.third_party_sources[key] = enabled
+        self._save_source_preferences()
+        if key == "copr" and (button := self.sidebar_rows.get("copr")):
+            button.set_visible(enabled)
+            if not enabled and self.page == "copr":
+                self.navigate("explore")
+                return
+        if key == "flatpak" and enabled:
+            self._load_flatpak_catalog()
+        if key == "terra" and enabled:
+            self._reload_data()
+            return
+        source = {"terra": "Terra", "copr": "COPR", "flatpak": "Flatpak"}[key]
+        if not enabled and self.filter_source == source:
+            self.filter_source = "Todos"
+        self.render_page()
 
     def _select_sidebar_row(self) -> None:
         btn = self.sidebar_rows.get(self.page)
-        if btn and not btn.get_active():
-            btn.set_active(True)
+        if btn:
+            if not btn.get_active():
+                btn.set_active(True)
+            return
+        for nav_button in self.sidebar_rows.values():
+            if nav_button.get_active():
+                nav_button.set_active(False)
 
     def _nav_clicked(self, btn: Gtk.ToggleButton, key: str) -> None:
         if not btn.get_active():
@@ -390,6 +889,8 @@ class FedoraStore(Adw.Application):
     def navigate(self, page: str) -> None:
         self.page = page
         self.detail_package = None
+        self.copr_package_project = None
+        self.local_rpm_detail = False
         self.selected.clear()
         self._select_sidebar_row()
         self.render_page()
@@ -408,11 +909,15 @@ class FedoraStore(Adw.Application):
             return
         self._focus_attr = self._focus_attr_now()
         self.safe = True
+        self._refresh_topbar_search()
         self._clear(self.main_box)
         view = Adw.ToolbarView()
         header = Adw.HeaderBar()
-        if self.detail_package:
-            title = _("Detalhes do aplicativo")
+        child_view = self.detail_package is not None or self.copr_package_project is not None or self.local_rpm_detail
+        if child_view:
+            title = _("Detalhes do aplicativo") if self.detail_package else (
+                _("Pacote RPM local") if self.local_rpm_detail else _("Pacotes do projeto COPR")
+            )
             back = Gtk.Button()
             row = Gtk.Box(spacing=6)
             row.append(Gtk.Image(icon_name="go-previous-symbolic"))
@@ -427,19 +932,34 @@ class FedoraStore(Adw.Application):
         title_label = Gtk.Label(label=title)
         title_label.add_css_class("fs-header-title")
         header.set_title_widget(title_label)
-        view.add_top_bar(header)
+        header.set_show_end_title_buttons(False)
+        if child_view:
+            view.add_top_bar(header)
+        self._topnav_subnav = None
+        if not child_view and self._topbar_search:
+            subnav = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+            subnav.add_css_class("fs-subnav")
+            subnav.set_hexpand(True)
+            self._topbar_search.set_halign(Gtk.Align.CENTER)
+            self._topbar_search.set_width_chars(24)
+            subnav.append(self._topbar_search)
+            self._topnav_subnav = subnav
+            self.main_box.append(subnav)
 
         scroller = Gtk.ScrolledWindow()
         scroller.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
         scroller.set_vexpand(True)
-        clamp = Adw.Clamp(tightening_threshold=900, maximum_size=1100)
+        self._catalog_scroller = scroller
+        if self.page == "explore" and not self.detail_package:
+            scroller.get_vadjustment().connect("value-changed", self._catalog_scrolled)
+        clamp = Adw.Clamp(tightening_threshold=1400, maximum_size=2000)
         scroller.set_child(clamp)
         view.set_content(scroller)
         body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=26)
-        body.set_margin_top(34)
+        body.set_margin_top(20)
         body.set_margin_bottom(40)
-        body.set_margin_start(32)
-        body.set_margin_end(32)
+        body.set_margin_start(24)
+        body.set_margin_end(24)
         clamp.set_child(body)
         self.main_box.append(view)
         renderers = {
@@ -448,15 +968,23 @@ class FedoraStore(Adw.Application):
             "updates": self._updates,
             "copr": self._copr_page,
             "sources": self._sources,
+            "settings": self._settings,
+            "local": self._local_rpm_page,
         }
         self.safe = False
         if self.detail_package:
             self._render_detail(body)
+        elif self.copr_package_project:
+            self._render_copr_project_packages(body)
+        elif self.local_rpm_detail:
+            self._render_local_rpm_detail(body)
         else:
             renderers.get(self.page, self._explore)(body)
 
     def _back_to_catalog(self, *_args: object) -> None:
         self.detail_package = None
+        self.copr_package_project = None
+        self.local_rpm_detail = False
         self.render_page()
 
     def _page_block(self, body: Gtk.Box, title: str, subtitle: str) -> Gtk.Box:
@@ -528,14 +1056,10 @@ class FedoraStore(Adw.Application):
             self.search_results = None
             self._active_search = ""
             self.search_token += 1
-            self._clear_copr_search()
             self.render_page()
             return
         if text.casefold() == self._active_search and self.search_results is not None:
-            if self.copr_search_data is None and not self.copr_search_pending:
-                self._begin_copr_search(text)
-            else:
-                self.render_page()
+            self.render_page()
             return
         self._begin_search(text)
 
@@ -547,7 +1071,6 @@ class FedoraStore(Adw.Application):
             self.search_results = None
             self._active_search = ""
             self.search_token += 1
-            self._clear_copr_search()
         if attr == "copr_query":
             self.copr_projects_token += 1
             self.copr_projects_pending = False
@@ -594,13 +1117,16 @@ class FedoraStore(Adw.Application):
         origin = package.origin
         label = Gtk.Label(label=origin, xalign=0)
         label.add_css_class("fs-origin")
-        key = {"DNF": "dnf", "Terra": "terra"}.get(origin, "copr")
+        key = {"DNF": "dnf", "Terra": "terra", "Flatpak": "flatpak"}.get(origin, "copr")
         label.add_css_class(f"fs-origin-{key}")
         return label
 
     # ---------- Search ----------
 
     def _begin_search(self, query: str) -> None:
+        if self.page == "explore" and self.filter_source == "Flatpak":
+            self._begin_flatpak_search(query)
+            return
         self._active_search = query.casefold()
         self.search_token += 1
         token = self.search_token
@@ -624,44 +1150,7 @@ class FedoraStore(Adw.Application):
             GLib.idle_add(self._finish_search, token, query.casefold(), rows)
 
         threading.Thread(target=worker, daemon=True).start()
-        self._begin_copr_search(query)
 
-    def _clear_copr_search(self) -> None:
-        self.copr_search_token += 1
-        self.copr_search_pending = False
-        self.copr_search_data = None
-        self.copr_search_failed = False
-
-    def _begin_copr_search(self, query: str) -> None:
-        """Kick a Copr APIv3 search (projects + packages) in the background."""
-        self.copr_search_token += 1
-        token = self.copr_search_token
-        self.copr_search_pending = True
-        self.copr_search_data = None
-        self.copr_search_failed = False
-
-        def worker() -> None:
-            data: dict | None = None
-            try:
-                data = repo.copr_search(query)
-            except Exception:
-                data = None
-            GLib.idle_add(self._finish_copr_search, token, data)
-
-        threading.Thread(target=worker, daemon=True).start()
-
-    def _finish_copr_search(self, token: int, data: dict | None) -> bool:
-        if token != self.copr_search_token:
-            return False
-        self.copr_search_pending = False
-        if data is None:
-            self.copr_search_failed = True
-            self.copr_search_data = None
-        else:
-            self.copr_search_data = data
-        if self.page == "explore" and not self.detail_package:
-            self.render_page()
-        return False
 
     def _begin_copr_projects(self, query: str) -> None:
         """Search COPR projects through the API (sources page)."""
@@ -670,6 +1159,8 @@ class FedoraStore(Adw.Application):
         self.copr_projects_pending = True
         self.copr_projects_data = None
         self.copr_projects_failed = False
+        if self.page == "copr" and not self.detail_package:
+            self.render_page()
 
         def worker() -> None:
             data: list[dict] | None = None
@@ -708,12 +1199,11 @@ class FedoraStore(Adw.Application):
     # ---------- Explorar ----------
 
     def _explore(self, body: Gtk.Box) -> None:
-        self._page_block(body, _("Explore aplicativos"), _("Catálogo real do Fedora e das fontes habilitadas neste sistema."))
-        body.append(self._search_entry(_("Buscar pacotes nos repositórios"), "query"))
-
         controls = Gtk.Box(spacing=8)
         first: Gtk.ToggleButton | None = None
         for source, _key in CHIP_SOURCES:
+            if source in ("Terra", "COPR", "Flatpak") and not self.third_party_sources[source.casefold()]:
+                continue
             chip = Gtk.ToggleButton(label=_(source))
             chip.add_css_class("fs-chip")
             if source == self.filter_source:
@@ -746,7 +1236,11 @@ class FedoraStore(Adw.Application):
         linked.append(grid_btn)
         linked.append(list_btn)
         controls.append(linked)
-        body.append(controls)
+        (self._topnav_subnav or body).append(controls)
+
+        if self.filter_source == "Flatpak":
+            self._explore_flatpak(body)
+            return
 
         if not self.ready:
             body.append(self._state_card(_("Carregando catálogo"), _("Lendo os repositórios do sistema…"), spinner=True))
@@ -760,41 +1254,99 @@ class FedoraStore(Adw.Application):
             body.append(self._state_card(_("Carregando catálogo"), _("Consultando os repositórios do sistema…"), spinner=True))
             return
 
-        section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        heading = Gtk.Label(label=_("Aplicativos para você"), xalign=0)
-        heading.add_css_class("fs-page-title")
-        section.append(heading)
-        caption = Gtk.Label(label=_("Pacotes disponíveis nos repositórios habilitados"), xalign=0)
-        caption.add_css_class("dim-label")
-        section.append(caption)
-        body.append(section)
 
         if self.selected and self.page == "explore":
-            body.append(self._bulk_bar(_("Aplicar selecionados")))
-        rows = self._featured_rows()
-        if not rows:
+            body.append(self._bulk_bar(_("Instalar selecionados")))
+        data_rows = self._featured_data_rows()
+        if not data_rows:
             message = _("Ainda não há dados dos repositórios; aguarde ou tente novamente.")
             body.append(self._state_card(
                 _("Nenhum resultado encontrado"), message,
                 icon="system-search-symbolic", action_label=_("Recarregar"),
                 callback=self._reload_data))
             return
+        rows = self._featured_rows(data_rows[:self.featured_visible])
         grid = Gtk.FlowBox()
         grid.set_selection_mode(Gtk.SelectionMode.NONE)
         grid.set_homogeneous(True)
+        grid.set_hexpand(True)
+        grid.set_halign(Gtk.Align.FILL)
         grid.set_min_children_per_line(1)
-        grid.set_max_children_per_line(3)
+        grid.set_max_children_per_line(4)
         grid.set_column_spacing(16)
         grid.set_row_spacing(16)
         grid.set_valign(Gtk.Align.START)
         for package in rows:
             grid.append(self._package_card(package))
         body.append(grid)
+        if self.featured_loading_more and self.featured_visible < len(data_rows):
+            loader = Gtk.Box(spacing=8)
+            loader.set_halign(Gtk.Align.CENTER)
+            spinner = Gtk.Spinner(spinning=True)
+            loader.append(spinner)
+            loader.append(Gtk.Label(label=_("Carregando mais aplicativos…")))
+            body.append(loader)
+
+    def _explore_flatpak(self, body: Gtk.Box) -> None:
+        if not self.flatpak_ready:
+            self._load_flatpak_catalog()
+            body.append(self._state_card(
+                _("Carregando Flatpak"),
+                _("Consultando o catálogo público do Flathub…"),
+                spinner=True,
+            ))
+            return
+        query = self.query.casefold()
+        if query and self.flatpak_search_query == query:
+            if self.flatpak_search_loading:
+                body.append(self._state_card(
+                    _("Buscando no Flathub"),
+                    _("Consultando aplicativos para “{0}”…").format(self.query),
+                    spinner=True,
+                ))
+                return
+            rows = self.flatpak_search_rows or []
+        else:
+            rows = [
+                row for row in self.flatpak_rows
+                if not query or query in f"{row['name']} {row['summary']} {row['flatpak_id']}".casefold()
+            ]
+        if not rows:
+            body.append(self._state_card(
+                _("Nenhum aplicativo encontrado"),
+                _("O Flathub não retornou aplicativos para esta busca."),
+                icon="system-search-symbolic",
+            ))
+            return
+        grid = Gtk.FlowBox()
+        grid.set_selection_mode(Gtk.SelectionMode.NONE)
+        grid.set_homogeneous(True)
+        grid.set_hexpand(True)
+        grid.set_halign(Gtk.Align.FILL)
+        grid.set_min_children_per_line(1)
+        grid.set_max_children_per_line(4)
+        grid.set_column_spacing(16)
+        grid.set_row_spacing(16)
+        for row in rows:
+            installed = self.flatpak_installed.get(row["flatpak_id"], {})
+            package = Package(
+                name=row["name"],
+                summary=row["summary"],
+                description=row["description"],
+                icon="application-x-executable-symbolic",
+                source="Flatpak",
+                repo_id="flathub",
+                version=row["version"],
+                installed_version=installed.get("version") or None,
+                flatpak_id=row["flatpak_id"],
+                icon_url=row["icon"],
+            )
+            grid.append(self._package_card(package))
+        body.append(grid)
 
     def _explore_search(self, body: Gtk.Box) -> None:
         if self.search_pending and self.search_results is None:
             body.append(self._state_card(_("Buscando"), _("Consultando o DNF por “{0}”…").format(self.query), spinner=True))
-            body.append(self._copr_results_section())
             return
         rows = self.search_results or []
         cards = []
@@ -828,7 +1380,6 @@ class FedoraStore(Adw.Application):
                 note = Gtk.Label(label=_("Mostrando os {0} primeiros de {1} resultados — refine a busca.").format(len(cards), total), xalign=0, wrap=True)
                 note.add_css_class("dim-label")
                 body.append(note)
-        body.append(self._copr_results_section())
 
     # ---------- COPR via API ----------
 
@@ -842,144 +1393,224 @@ class FedoraStore(Adw.Application):
                     projects.add(project)
         return projects
 
-    def _copr_results_section(self) -> Gtk.Widget:
-        section = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-        heading = Gtk.Label(label=_("COPR  ·  Descoberta pela API comunitária"), xalign=0)
-        heading.add_css_class("fs-page-title")
-        section.append(heading)
-        caption = Gtk.Label(label=_("Projetos e pacotes de copr.fedorainfracloud.org, mesmo sem estar habilitado."), xalign=0, wrap=True)
-        caption.add_css_class("dim-label")
-        section.append(caption)
-
-        if self.copr_search_pending:
-            section.append(self._state_card(
-                _("Buscando no COPR"),
-                _("Pesquisando projetos e pacotes na API do Fedora…"),
-                spinner=True,
-            ))
-            return section
-        if self.copr_search_failed:
-            section.append(self._state_card(
-                _("API do COPR indisponível"),
-                _("Não foi possível consultar copr.fedorainfracloud.org. Verifique a conexão."),
-                icon="network-offline-symbolic",
-                action_label=_("Tentar novamente"),
-                callback=lambda *_: self._begin_copr_search(self.query),
-            ))
-            return section
-        data = self.copr_search_data
-        if not data:
-            return section
-        packages = list(data.get("packages") or [])
-        projects = list(data.get("projects") or [])
-        if not packages and not projects:
-            section.append(self._state_card(
-                _("Nenhum resultado no COPR"),
-                _("A API comunitária não encontrou projetos ou pacotes para “{0}”.").format(self.query),
-                icon="system-search-symbolic",
-            ))
-            return section
-        enabled = self._enabled_copr_projects()
-        if packages:
-            listbox = Gtk.ListBox()
-            listbox.set_selection_mode(Gtk.SelectionMode.NONE)
-            listbox.add_css_class("card")
-            listbox.add_css_class("boxed-list")
-            for pkg in packages[:8]:
-                listbox.append(self._copr_package_row(pkg, enabled))
-            section.append(listbox)
-        else:
-            cards = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
-            for project in projects[:4]:
-                cards.append(self._copr_project_card(project, enabled))
-            section.append(cards)
-        return section
-
-    def _copr_package_row(self, pkg: dict, enabled: set[str]) -> Gtk.Widget:
-        row = Gtk.Box(spacing=14)
-        row.set_margin_top(12)
-        row.set_margin_bottom(12)
-        row.set_margin_start(16)
-        row.set_margin_end(16)
-        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
-        texts.set_hexpand(True)
-        title = Gtk.Label(label=str(pkg.get("name") or ""), xalign=0, wrap=True)
-        title.add_css_class("fs-name")
-        texts.append(title)
-        owner = str(pkg.get("ownername") or "")
-        project_name = str(pkg.get("projectname") or "")
-        maintainer = str(pkg.get("contact") or owner)
-        sub = Gtk.Label(
-            label=_("{0} · mantenedor {1}").format(pkg.get("project_full_name") or f"{owner}/{project_name}", maintainer),
-            xalign=0, wrap=True,
-        )
-        sub.add_css_class("dim-label")
-        sub.add_css_class("fs-note")
-        texts.append(sub)
-        if pkg.get("project_description"):
-            desc_text = str(pkg["project_description"]).strip().replace("\n", " ")
-            if len(desc_text) > 160:
-                desc_text = desc_text[:157] + "…"
-            desc = Gtk.Label(label=desc_text, xalign=0, wrap=True)
-            desc.add_css_class("dim-label")
-            texts.append(desc)
-        row.append(texts)
-        project = f"{owner}/{project_name}"
-        if project in enabled:
-            status = Gtk.Label(label="●  " + _("Habilitado"), xalign=0)
-            status.add_css_class("fs-status-ok")
-            status.set_valign(Gtk.Align.CENTER)
-            row.append(status)
-        else:
-            enable = Gtk.Button()
-            side = Gtk.Box(spacing=6)
-            side.append(Gtk.Label(label=_("Habilitar")))
-            side.append(Gtk.Image(icon_name="go-next-symbolic"))
-            enable.set_child(side)
-            enable.add_css_class("flat")
-            enable.add_css_class("fs-linkbtn")
-            enable.set_valign(Gtk.Align.CENTER)
-            enable.connect("clicked", self._enable_copr_project, project)
-            row.append(enable)
-        return row
 
     def _copr_project_card(self, project: dict, enabled: set[str]) -> Gtk.Widget:
-        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        card.add_css_class("card")
-        card.set_margin_top(4)
-        card.set_margin_bottom(4)
-        name = Gtk.Label(label=str(project.get("full_name") or project.get("name") or ""), xalign=0, wrap=True)
-        name.add_css_class("fs-name")
-        card.append(name)
+        owner = str(project.get("ownername") or "")
+        project_name = str(project.get("name") or "")
+        full_name = str(project.get("full_name") or f"{owner}/{project_name}".strip("/"))
         description = str(project.get("description") or "").strip().replace("\n", " ")
-        if len(description) > 220:
-            description = description[:217] + "…"
+        if len(description) > 180:
+            description = description[:177] + "…"
+        contact = str(project.get("contact") or owner or "—")
+
+        card = Gtk.Box(spacing=14)
+        card.add_css_class("card")
+        card.set_size_request(-1, 112)
+        card.set_margin_top(2)
+        card.set_margin_bottom(2)
+
+        icon = Gtk.Image(icon_name="folder-remote-symbolic", pixel_size=24)
+        icon.add_css_class("fs-dim-icon")
+        icon.set_margin_start(16)
+        icon.set_valign(Gtk.Align.CENTER)
+        card.append(icon)
+
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
+        texts.set_hexpand(True)
+        texts.set_valign(Gtk.Align.CENTER)
+        name = Gtk.Label(label=full_name, xalign=0)
+        name.add_css_class("fs-name")
+        name.set_ellipsize(Pango.EllipsizeMode.END)
+        texts.append(name)
         if description:
-            desc = Gtk.Label(label=description, xalign=0, wrap=True)
+            desc = Gtk.Label(label=description, xalign=0)
             desc.add_css_class("dim-label")
-            card.append(desc)
-        contact = project.get("contact")
-        footer = Gtk.Box(spacing=10)
-        maintainer = Gtk.Label(
-            label=_("Mantenedor: {0}").format(contact or project.get("ownername") or "—"),
-            xalign=0,
-        )
+            desc.set_ellipsize(Pango.EllipsizeMode.END)
+            texts.append(desc)
+        maintainer = Gtk.Label(label=_("Mantenedor: {0}").format(contact), xalign=0)
         maintainer.add_css_class("dim-label")
-        maintainer.set_hexpand(True)
-        footer.append(maintainer)
-        full_name = str(project.get("full_name") or "")
+        maintainer.add_css_class("fs-note")
+        texts.append(maintainer)
+        card.append(texts)
+
+        view_packages = Gtk.Button(label=_("Ver pacotes"))
+        view_packages.add_css_class("fs-pillbtn")
+        view_packages.set_valign(Gtk.Align.CENTER)
+        view_packages.connect("clicked", self._open_copr_project_packages, owner, project_name, full_name)
+        card.append(view_packages)
+
         if full_name in enabled:
             status = Gtk.Label(label="●  " + _("Habilitado"))
             status.add_css_class("fs-status-ok")
-            footer.append(status)
+            status.set_margin_end(16)
+            status.set_valign(Gtk.Align.CENTER)
+            card.append(status)
         else:
             enable = Gtk.Button(label=_("Habilitar"))
             enable.add_css_class("suggested-action")
             enable.add_css_class("fs-pillbtn")
+            enable.set_margin_end(16)
+            enable.set_valign(Gtk.Align.CENTER)
             enable.connect("clicked", self._enable_copr_project, full_name)
-            footer.append(enable)
-        card.append(footer)
+            card.append(enable)
         return card
+
+    def _open_copr_project_packages(
+        self, _button: Gtk.Widget, owner: str, project_name: str, full_name: str
+    ) -> None:
+        if not owner or not project_name:
+            self._toast(_("Projeto COPR inválido."))
+            return
+        project_key = f"{owner}/{project_name}"
+        self.copr_package_project = (owner, project_name, full_name)
+        if project_key in self._copr_project_packages or project_key in self._copr_project_packages_loading:
+            self.render_page()
+            return
+        self._copr_project_packages_loading.add(project_key)
+        self.render_page()
+
+        def worker() -> None:
+            try:
+                packages = repo.copr_packages(owner, project_name, limit=120, include_builds=True)
+            except Exception:
+                packages = []
+                failed = True
+            else:
+                failed = False
+            GLib.idle_add(self._finish_copr_project_packages, project_key, packages, failed)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_copr_project_packages(self, project_key: str, packages: list[dict], failed: bool) -> bool:
+        self._copr_project_packages_loading.discard(project_key)
+        if failed:
+            self._copr_project_packages_failed.add(project_key)
+        else:
+            self._copr_project_packages[project_key] = packages
+            self._copr_project_packages_failed.discard(project_key)
+        if self.copr_package_project and project_key == "/".join(self.copr_package_project[:2]):
+            self.render_page()
+        return False
+
+    def _render_copr_project_packages(self, body: Gtk.Box) -> None:
+        project = self.copr_package_project
+        if not project:
+            return
+        owner, project_name, full_name = project
+        project_key = f"{owner}/{project_name}"
+        self._page_block(
+            body,
+            _("Pacotes de {0}").format(full_name),
+            _("Pacotes publicados neste projeto COPR. Habilite o projeto somente após revisar a lista."),
+        )
+        if project_key in self._copr_project_packages_loading:
+            body.append(self._state_card(
+                _("Carregando pacotes"),
+                _("Consultando a API pública do COPR…"),
+                spinner=True,
+            ))
+            return
+        if project_key in self._copr_project_packages_failed:
+            body.append(self._state_card(
+                _("Pacotes indisponíveis"),
+                _("Não foi possível consultar os pacotes deste projeto COPR."),
+                icon="network-offline-symbolic",
+                action_label=_("Tentar novamente"),
+                callback=lambda *_: self._retry_copr_project_packages(owner, project_name, full_name),
+            ))
+            return
+        packages = self._copr_project_packages.get(project_key, [])
+        if not packages:
+            body.append(self._state_card(
+                _("Nenhum pacote publicado"),
+                _("A API do COPR não retornou pacotes para este projeto."),
+                icon="folder-remote-symbolic",
+            ))
+            return
+        def value_cell(text: str, width: int, css_class: str = "") -> Gtk.Label:
+            cell = Gtk.Label(label=text, xalign=0)
+            cell.add_css_class("fs-copr-value")
+            if css_class:
+                cell.add_css_class(css_class)
+            cell.set_size_request(width, -1)
+            cell.set_ellipsize(Pango.EllipsizeMode.END)
+            return cell
+
+        columns = (
+            (_("Pacote"), 260),
+            (_("Última versão"), 170),
+            (_("Enviado em"), 170),
+            (_("Status"), 140),
+            (_("Build automático"), 160),
+        )
+        table = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        table.add_css_class("card")
+        table.add_css_class("fs-copr-table")
+        header = Gtk.Box(spacing=24)
+        header.add_css_class("fs-copr-table-header")
+        header.set_margin_start(10)
+        header.set_margin_end(10)
+        for label, width in columns:
+            header_label = Gtk.Label(label=label, xalign=0)
+            header_label.add_css_class("fs-copr-table-header-label")
+            header_label.set_size_request(width, -1)
+            if label == _("Pacote"):
+                header_label.set_hexpand(True)
+            header.append(header_label)
+        table.append(header)
+
+        package_list = Gtk.ListBox()
+        package_list.set_selection_mode(Gtk.SelectionMode.NONE)
+        package_list.add_css_class("boxed-list")
+        for package in packages:
+            build = package.get("latest_build") if isinstance(package.get("latest_build"), dict) else {}
+            source = build.get("source_package") if isinstance(build.get("source_package"), dict) else {}
+            submitted = build.get("submitted_on")
+            try:
+                submitted_text = datetime.fromtimestamp(int(submitted)).strftime("%d/%m/%Y %H:%M")
+            except (TypeError, ValueError, OSError):
+                submitted_text = "—"
+            state = str(build.get("state") or "")
+            status_text, status_class = {
+                "succeeded": (_("Concluído"), "fs-copr-status-ok"),
+                "failed": (_("Falhou"), "fs-copr-status-failed"),
+                "forked": (_("Em andamento"), "fs-copr-status-running"),
+                "pending": (_("Na fila"), "fs-copr-status-running"),
+            }.get(state, (state or _("Sem build"), ""))
+
+            row = Gtk.Box(spacing=24)
+            row.add_css_class("fs-copr-table-row")
+            row.set_margin_top(3)
+            row.set_margin_bottom(3)
+            row.set_margin_start(10)
+            row.set_margin_end(10)
+            package_info = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+            package_info.set_hexpand(True)
+            package_info.set_size_request(columns[0][1], -1)
+            name = Gtk.Label(label=str(package.get("name") or _("Pacote sem nome")), xalign=0)
+            name.add_css_class("fs-copr-package")
+            name.set_ellipsize(Pango.EllipsizeMode.END)
+            source_type = str(package.get("source_type") or "")
+            if source_type:
+                name.set_tooltip_text(_("Origem: {0}").format(source_type))
+            package_info.append(name)
+            row.append(package_info)
+            row.append(value_cell(str(source.get("version") or "—"), columns[1][1]))
+            row.append(value_cell(submitted_text, columns[2][1]))
+            status = value_cell(status_text, columns[3][1], "fs-copr-status")
+            if status_class:
+                status.add_css_class(status_class)
+            row.append(status)
+            auto_text = _("Ativado") if package.get("auto_rebuild") else _("Desativado")
+            auto = value_cell(auto_text, columns[4][1], "fs-status-ok" if package.get("auto_rebuild") else "fs-status-off")
+            row.append(auto)
+            package_list.append(row)
+        table.append(package_list)
+        body.append(table)
+
+    def _retry_copr_project_packages(self, owner: str, project_name: str, full_name: str) -> None:
+        self._copr_project_packages_failed.discard(f"{owner}/{project_name}")
+        self._open_copr_project_packages(Gtk.Button(), owner, project_name, full_name)
 
     def _enable_copr_project(self, _button: Gtk.Widget, project: str) -> None:
         if not project or "/" not in project:
@@ -989,18 +1620,63 @@ class FedoraStore(Adw.Application):
 
     def _reload_data(self, *_args: object) -> None:
         self.featured_ready = False
+        self.featured_visible = 48
+        self.featured_loading_more = False
         self.render_page()
         self._load_initial()
 
-    def _featured_rows(self) -> list[Package]:
-        rows: list[Package] = []
+    def _catalog_scrolled(self, adjustment: Gtk.Adjustment) -> None:
+        if self.page != "explore" or self.detail_package or self.query or self.featured_loading_more:
+            return
+        if adjustment.get_value() + adjustment.get_page_size() < adjustment.get_upper() - 32:
+            return
+        if self.featured_visible >= len(self._featured_data_rows()):
+            return
+        self.featured_loading_more = True
+        self._catalog_scroll_y = adjustment.get_value()
+        self.render_page()
+        GLib.idle_add(self._restore_catalog_scroll)
+        GLib.timeout_add(150, self._finish_featured_load)
+
+    def _finish_featured_load(self) -> bool:
+        self.featured_visible += 48
+        self.featured_loading_more = False
+        self.render_page()
+        GLib.idle_add(self._restore_catalog_scroll)
+        return False
+
+    def _restore_catalog_scroll(self) -> bool:
+        if self._catalog_scroller:
+            self._catalog_scroller.get_vadjustment().set_value(self._catalog_scroll_y)
+        return False
+
+    def _featured_data_rows(self) -> list[dict]:
+        key = (self.filter_source, self.sort_mode)
+        if key == self._featured_view_key:
+            return self._featured_view_rows
+
+        rows = []
         for row in self.packages_featured:
             name = row["name"]
             if self.filter_source == "Instalados" and name not in self.packages_installed:
                 continue
             if self.filter_source not in ("Todos", "Instalados"):
-                if repo.repo_label(row.get("repository", "")) != self.filter_source:
+                source = "Fedora" if self.filter_source == "DNF" else self.filter_source
+                if repo.repo_label(row.get("repository", "")) != source:
                     continue
+            rows.append(row)
+        if self.sort_mode == 0:
+            rows.sort(key=lambda row: row["name"].casefold())
+        else:
+            rows.sort(key=lambda row: (repo.repo_label(row.get("repository", "")), row["name"].casefold()))
+        self._featured_view_key = key
+        self._featured_view_rows = rows
+        return rows
+
+    def _featured_rows(self, raw_rows: list[dict]) -> list[Package]:
+        rows: list[Package] = []
+        for row in raw_rows:
+            name = row["name"]
             package = self._pkg(name)
             if package:
                 package.version = row.get("version", package.version)
@@ -1011,22 +1687,25 @@ class FedoraStore(Adw.Application):
                 if not package.installed and name in self.packages_installed:
                     package.installed_version = self.packages_installed[name].get("evr")
                 rows.append(package)
-        if self.sort_mode == 0:
-            rows.sort(key=lambda package: package.name.casefold())
-        else:
-            rows.sort(key=lambda package: (package.source, package.name.casefold()))
         return rows
 
     def _filter_toggled(self, button: Gtk.ToggleButton, source: str) -> None:
         if self.safe or not button.get_active() or source == self.filter_source:
             return
         self.filter_source = source
+        self._featured_view_key = None
+        self._featured_view_rows = []
+        self.featured_visible = 48
+        self.featured_loading_more = False
+        self._catalog_scroll_y = 0.0
         self.render_page()
 
     def _sort_changed(self, dropdown: Gtk.DropDown, _param: object) -> None:
         if self.safe:
             return
         self.sort_mode = dropdown.get_selected()
+        self._featured_view_key = None
+        self._featured_view_rows = []
         self.render_page()
 
     def _view_toggled(self, button: Gtk.ToggleButton, mode: str) -> None:
@@ -1035,45 +1714,94 @@ class FedoraStore(Adw.Application):
         self.view_mode = mode
         self.render_page()
 
+    def _package_image(self, package: Package, pixel_size: int) -> Gtk.Image:
+        image = Gtk.Image(icon_name=package.icon, pixel_size=pixel_size)
+        if not package.icon_url:
+            return image
+        texture = self._flatpak_icon_cache.get(package.icon_url)
+        if texture:
+            image.set_from_paintable(texture)
+            image.set_pixel_size(pixel_size)
+            return image
+        self._flatpak_icon_widgets.setdefault(package.icon_url, []).append(image)
+        if package.icon_url not in self._flatpak_icon_pending:
+            self._flatpak_icon_pending.add(package.icon_url)
+
+            def worker() -> None:
+                try:
+                    data = repo.download_icon(package.icon_url)
+                except Exception:
+                    data = b""
+                GLib.idle_add(self._finish_flatpak_icon, package.icon_url, data)
+
+            threading.Thread(target=worker, daemon=True).start()
+        return image
+
+    def _finish_flatpak_icon(self, url: str, data: bytes) -> bool:
+        self._flatpak_icon_pending.discard(url)
+        if not data:
+            self._flatpak_icon_widgets.pop(url, None)
+            return False
+        try:
+            texture = Gdk.Texture.new_from_bytes(GLib.Bytes.new(data))
+        except Exception:
+            self._flatpak_icon_widgets.pop(url, None)
+            return False
+        self._flatpak_icon_cache[url] = texture
+        for image in self._flatpak_icon_widgets.pop(url, []):
+            image.set_from_paintable(texture)
+            image.set_pixel_size(32)
+        return False
+
+    def _detail_id(self, package: Package) -> str:
+        identity = package.flatpak_id or package.repo_id or package.name
+        target = f"{package.source}:{identity}:{package.name}"
+        self._detail_packages[target] = package
+        return target
+
     def _package_card(self, package: Package) -> Gtk.Widget:
-        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
         card.add_css_class("card")
-        card.set_size_request(300, 190)
+        card.set_size_request(220, 124)
+        card.set_vexpand(False)
+        card.set_valign(Gtk.Align.START)
         card.set_margin_top(2)
         card.set_margin_bottom(2)
         card.set_margin_start(2)
         card.set_margin_end(2)
 
-        top = Gtk.Box(spacing=14)
-        top.set_valign(Gtk.Align.START)
-        top.set_margin_top(18)
-        top.set_margin_start(18)
-        top.set_margin_end(18)
-        intro = Gtk.Box(spacing=14)
+        intro = Gtk.Box(spacing=10)
         intro.set_hexpand(True)
-        intro.append(Gtk.Image(icon_name=package.icon, pixel_size=44))
-        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
-        name = Gtk.Label(label=package.name, xalign=0, wrap=True)
+        intro.set_margin_top(12)
+        intro.set_margin_start(12)
+        intro.set_margin_end(12)
+        if not package.installed and not package.updatable and package.source != "Flatpak":
+            select = Gtk.CheckButton()
+            select.set_active(package.name in self.selected)
+            select.set_tooltip_text(_("Selecionar para instalar"))
+            select.set_valign(Gtk.Align.CENTER)
+            select.connect("toggled", self._selection_changed, package.name)
+            intro.append(select)
+        intro.append(self._package_image(package, 32))
+        name = Gtk.Label(label=package.name, xalign=0)
         name.add_css_class("fs-name")
-        texts.append(name)
-        summary = Gtk.Label(label=package.summary or _("Versão {0}").format(package.version or package.origin), xalign=0, wrap=True, max_width_chars=26)
-        summary.add_css_class("dim-label")
-        texts.append(summary)
-        intro.append(texts)
-        top.append(intro)
-        card.append(top)
+        name.set_ellipsize(Pango.EllipsizeMode.END)
+        name.set_tooltip_text(package.name)
+        name.set_hexpand(True)
+        intro.append(name)
+        detail = Gtk.GestureClick()
+        detail.connect("released", self._open_detail, package)
+        name.add_controller(detail)
+        card.append(intro)
+
         spacer = Gtk.Box()
         spacer.set_vexpand(True)
         card.append(spacer)
-        detail = Gtk.GestureClick()
-        detail.connect("released", self._open_detail, package)
-        intro.add_controller(detail)
 
-        actions = Gtk.Box(spacing=8)
-        actions.set_margin_top(4)
-        actions.set_margin_bottom(16)
-        actions.set_margin_start(18)
-        actions.set_margin_end(18)
+        actions = Gtk.Box(spacing=6)
+        actions.set_margin_bottom(12)
+        actions.set_margin_start(12)
+        actions.set_margin_end(12)
         origin = self._origin_label(package)
         origin.set_halign(Gtk.Align.START)
         origin.set_valign(Gtk.Align.CENTER)
@@ -1087,12 +1815,12 @@ class FedoraStore(Adw.Application):
             action.add_css_class("suggested-action")
             action.add_css_class("fs-bold")
         action.add_css_class("fs-pillbtn")
+        action.add_css_class("fs-package-action")
         action.set_valign(Gtk.Align.CENTER)
         action.connect("clicked", self._package_action, package)
         actions.append(action)
         menu = Gio.Menu()
-        menu.append(_("Abrir detalhes"), detail_target(package.name))
-        menu.append(_("Selecionar"), "win.toggle-select::'" + package.name.replace("'", "''") + "'")
+        menu.append(_("Abrir detalhes"), detail_target(self._detail_id(package)))
         more = Gtk.MenuButton(menu_model=menu)
         more.set_icon_name("view-more-symbolic")
         more.add_css_class("flat")
@@ -1129,6 +1857,7 @@ class FedoraStore(Adw.Application):
                 action.add_css_class("suggested-action")
                 action.add_css_class("fs-bold")
             action.add_css_class("fs-pillbtn")
+            action.add_css_class("fs-package-action")
             action.set_margin_start(10)
             action.connect("clicked", self._package_action, package)
             row.append(action)
@@ -1153,7 +1882,10 @@ class FedoraStore(Adw.Application):
         self.render_page()
 
     def _package_action(self, _button: Gtk.Widget, package: Package) -> None:
-        self._apply([package])
+        if package.source == "Flatpak":
+            self._apply_flatpak(package)
+        else:
+            self._apply([package])
 
     def _selection_changed(self, check: Gtk.CheckButton, name: str) -> None:
         if check.get_active():
@@ -1170,11 +1902,21 @@ class FedoraStore(Adw.Application):
         spacer = Gtk.Box()
         spacer.set_hexpand(True)
         bar.append(spacer)
+        clear = Gtk.Button(label=_("Limpar"))
+        clear.add_css_class("flat")
+        clear.connect("clicked", self._clear_selection)
+        bar.append(clear)
         button = Gtk.Button(label=_(action_label))
-        button.add_css_class("fs-danger-softbtn")
+        button.add_css_class("suggested-action")
+        button.add_css_class("fs-bold")
+        button.add_css_class("fs-pillbtn")
         button.connect("clicked", self._bulk_apply)
         bar.append(button)
         return bar
+
+    def _clear_selection(self, *_args: object) -> None:
+        self.selected.clear()
+        self.render_page()
 
     def _bulk_apply(self, *_args: object) -> None:
         packages = [self._pkg(name) for name in self.selected]
@@ -1185,7 +1927,6 @@ class FedoraStore(Adw.Application):
 
     def _installed(self, body: Gtk.Box) -> None:
         self._page_block(body, _("Aplicativos instalados"), _("Gerencie os pacotes presentes neste computador."))
-        body.append(self._search_entry(_("Buscar aplicativos instalados"), "query_installed"))
 
         controls = Gtk.Box(spacing=10)
         sources = ["Todas", "Fedora", "Terra", "COPR"]
@@ -1290,14 +2031,18 @@ class FedoraStore(Adw.Application):
             self._page_block(body, _("Verificando atualizações"), _("Consultando o sistema por pacotes desatualizados."))
             body.append(self._state_card(_("Verificando atualizações"), _("Consultando o DNF…"), spinner=True))
             return
-        packages = self._update_packages()
+        all_packages = self._update_packages()
+        packages = [
+            package for package in all_packages
+            if not self.query_updates or self.query_updates in package.name.casefold()
+        ]
         block = Gtk.Box(spacing=16)
         block.set_hexpand(True)
         texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         heading = Gtk.Label(label=_("Atualizações disponíveis"), xalign=0)
         heading.add_css_class("fs-heading")
         texts.append(heading)
-        count = len(packages)
+        count = len(all_packages)
         sub = Gtk.Label(label=_("{0} pacotes podem ser atualizados. Revise as alterações antes de continuar.").format(count), xalign=0, wrap=True)
         sub.add_css_class("dim-label")
         texts.append(sub)
@@ -1373,10 +2118,185 @@ class FedoraStore(Adw.Application):
         packages.sort(key=lambda p: p.name.casefold())
         return packages
 
+    # ---------- RPM local ----------
+
+    def _local_rpm_page(self, body: Gtk.Box) -> None:
+        self._page_block(body, _("Instalar RPM local"), _("Arraste um arquivo .rpm ou escolha-o no computador."))
+        drop = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        drop.add_css_class("card")
+        drop.add_css_class("fs-rpm-drop")
+        drop.set_halign(Gtk.Align.FILL)
+        drop.append(Gtk.Image(icon_name="package-x-generic-symbolic", pixel_size=40))
+        title = Gtk.Label(label=_("Solte um arquivo RPM aqui"), xalign=0)
+        title.add_css_class("fs-name")
+        title.set_halign(Gtk.Align.CENTER)
+        drop.append(title)
+        choose = Gtk.Button(label=_("Escolher arquivo"))
+        choose.add_css_class("fs-pillbtn")
+        choose.set_halign(Gtk.Align.CENTER)
+        choose.connect("clicked", self._choose_local_rpm)
+        drop.append(choose)
+        target = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        target.connect("drop", self._drop_local_rpm)
+        drop.add_controller(target)
+        body.append(drop)
+        if self.local_rpm_loading:
+            body.append(self._state_card(_("Lendo pacote"), _("Verificando os metadados do RPM…"), spinner=True))
+        elif self.local_rpm:
+            data = self.local_rpm
+            row = Adw.ActionRow(title=data["name"], subtitle=data["summary"] or _("Sem descrição"))
+            row.add_prefix(Gtk.Image(icon_name="package-x-generic-symbolic"))
+            row.add_suffix(Gtk.Label(label=f'{data["version"]} · {data["arch"]} · {int(data["size"] or 0) / 1_048_576:.1f} MB'))
+            install = Gtk.Button(label=_("Instalar"))
+            install.add_css_class("suggested-action")
+            install.add_css_class("fs-rpm-install")
+            install.set_valign(Gtk.Align.CENTER)
+            install.set_vexpand(False)
+            install.set_size_request(-1, 30)
+            install.connect("clicked", self._install_local_rpm)
+            row.add_suffix(install)
+            card = Gtk.ListBox()
+            card.add_css_class("card")
+            card.append(row)
+            body.append(card)
+
+    def _choose_local_rpm(self, _button: Gtk.Button) -> None:
+        dialog = Gtk.FileDialog(title=_("Escolher pacote RPM"))
+        dialog.open(self.window, None, self._finish_choose_local_rpm)
+
+    def _finish_choose_local_rpm(self, dialog: Gtk.FileDialog, result) -> None:
+        try:
+            file = dialog.open_finish(result)
+        except GLib.Error:
+            return
+        self._load_local_rpm(file.get_path() or "")
+
+    def _drop_local_rpm(self, _target: Gtk.DropTarget, files: Gdk.FileList, _x: float, _y: float) -> bool:
+        items = files.get_files()
+        if not items:
+            return False
+        first = items[0] if isinstance(items, list) else items.get_item(0)
+        self._load_local_rpm(first.get_path() or "")
+        return True
+
+    def _load_local_rpm(self, path: str) -> None:
+        self.local_rpm, self.local_rpm_loading = None, True
+        self.render_page()
+        def worker() -> None:
+            try:
+                data, error = repo.local_rpm_metadata(path), ""
+            except Exception as exception:
+                data, error = None, str(exception)
+            GLib.idle_add(self._finish_local_rpm, data, error)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_local_rpm(self, data: dict[str, str] | None, error: str) -> bool:
+        self.local_rpm_loading, self.local_rpm = False, data
+        self.local_rpm_detail = data is not None
+        self.render_page()
+        if error:
+            self._toast(_("Não foi possível ler o RPM: {0}").format(error[:130]))
+        return False
+
+    def _render_local_rpm_detail(self, body: Gtk.Box) -> None:
+        if not self.local_rpm:
+            return
+        data = self.local_rpm
+        hero = Gtk.Box(spacing=18)
+        icon_path = data.get("icon", "")
+        icon = Gtk.Image.new_from_file(icon_path) if icon_path else Gtk.Image(icon_name="package-x-generic-symbolic")
+        icon.set_pixel_size(72)
+        hero.append(icon)
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+        texts.set_hexpand(True)
+        name = Gtk.Label(label=data["name"], xalign=0)
+        name.add_css_class("fs-detail-title")
+        texts.append(name)
+        summary = Gtk.Label(label=data["summary"] or _("Pacote RPM local"), xalign=0, wrap=True)
+        summary.add_css_class("dim-label")
+        texts.append(summary)
+        texts.append(Gtk.Label(label=_("Pacote local · RPM"), xalign=0))
+        hero.append(texts)
+        install = Gtk.Button(label=_("Instalar"))
+        install.add_css_class("suggested-action")
+        install.add_css_class("fs-rpm-install")
+        install.set_valign(Gtk.Align.CENTER)
+        install.set_vexpand(False)
+        install.set_size_request(-1, 30)
+        install.connect("clicked", self._install_local_rpm)
+        hero.append(install)
+        body.append(hero)
+        rows = Gtk.ListBox()
+        rows.add_css_class("card")
+        rows.add_css_class("boxed-list")
+        for title, value in ((_("Versão"), data["version"]), (_("Arquitetura"), data["arch"]),
+                             (_("Tamanho"), f'{int(data["size"] or 0) / 1_048_576:.1f} MB'),
+                             (_("Arquivo"), data["path"])):
+            rows.append(Adw.ActionRow(title=title, subtitle=value))
+        body.append(rows)
+
+    def _install_local_rpm(self, _button: Gtk.Button) -> None:
+        if self.local_rpm and not self.busy:
+            self._run_root(["pkexec", "dnf", "install", "-y", self.local_rpm["path"]], _("Pacote local instalado"), "data")
+
     def _update_all(self, *_args: object) -> None:
         self._apply(self._update_packages())
 
     # ---------- Fontes ----------
+
+    def _settings(self, body: Gtk.Box) -> None:
+        self._page_block(
+            body,
+            _("Configurações"),
+            _("Controle quais fontes de terceiros aparecem no catálogo."),
+        )
+        heading = Gtk.Label(label=_("Fontes de terceiros"), xalign=0)
+        heading.add_css_class("fs-page-title")
+        body.append(heading)
+        note = Gtk.Label(
+            label=_("Ativar uma fonte do sistema solicita autorização pelo Polkit."),
+            xalign=0,
+            wrap=True,
+        )
+        note.add_css_class("dim-label")
+        note.add_css_class("fs-note")
+        body.append(note)
+        rows = Gtk.ListBox()
+        rows.set_selection_mode(Gtk.SelectionMode.NONE)
+        rows.add_css_class("card")
+        rows.add_css_class("boxed-list")
+        for key, title, subtitle in (
+            ("flatpak", _("Flatpak / Flathub"), _("Aplicativos em sandbox do Flathub.")),
+            ("terra", _("Terra"), _("Repositório comunitário para Fedora.")),
+            ("copr", _("COPR"), _("Escolha projetos comunitários individualmente.")),
+        ):
+            row = Adw.ActionRow(title=title, subtitle=subtitle)
+            switch = Gtk.Switch(active=self.third_party_sources[key])
+            switch.set_valign(Gtk.Align.CENTER)
+            switch.connect("state-set", self._source_switch_state, key)
+            row.add_suffix(switch)
+            rows.append(row)
+        body.append(rows)
+
+        behavior_heading = Gtk.Label(label=_("Execução em segundo plano"), xalign=0)
+        behavior_heading.add_css_class("fs-page-title")
+        behavior_heading.set_margin_top(18)
+        body.append(behavior_heading)
+        behavior = Gtk.ListBox()
+        behavior.set_selection_mode(Gtk.SelectionMode.NONE)
+        behavior.add_css_class("card")
+        behavior.add_css_class("boxed-list")
+        for key, title, subtitle in (
+            ("tray", _("Manter na bandeja"), _("Ao fechar a janela, mantenha o Aplicativos ativo na bandeja.")),
+            ("autostart", _("Iniciar ao entrar na sessão"), _("Inicia em segundo plano e avisa quando houver atualizações.")),
+        ):
+            row = Adw.ActionRow(title=title, subtitle=subtitle)
+            switch = Gtk.Switch(active=self.third_party_sources[key])
+            switch.set_valign(Gtk.Align.CENTER)
+            switch.connect("state-set", self._background_switch_state, key)
+            row.add_suffix(switch)
+            behavior.append(row)
+        body.append(behavior)
 
     def _sources(self, body: Gtk.Box) -> None:
         self._page_block(body, _("Fontes de aplicativos"), _("Repositórios configurados no DNF neste computador."))
@@ -1387,7 +2307,14 @@ class FedoraStore(Adw.Application):
         heading = Gtk.Label(label=_("Repositórios do sistema"), xalign=0)
         heading.add_css_class("fs-page-title")
         body.append(heading)
-        system_repos = [r for r in self.repos if not str(r["id"]).startswith(("copr:", "coprdep:"))]
+        system_repos = [
+            repo_row for repo_row in self.repos
+            if not str(repo_row["id"]).startswith(("copr:", "coprdep:"))
+            and (
+                not self.query_sources
+                or self.query_sources in f"{repo_row['id']} {repo_row['name']}".casefold()
+            )
+        ]
         if not system_repos:
             body.append(self._state_card(
                 _("Nenhum repositório encontrado"),
@@ -1417,16 +2344,12 @@ class FedoraStore(Adw.Application):
         if not self.ready:
             body.append(self._state_card(_("Carregando fontes"), _("Lendo a lista de repositórios…"), spinner=True))
             return
-        body.append(self._search_entry(_("Buscar projetos COPR na API"), "copr_query"))
         all_copr = [r for r in self.repos if str(r["id"]).startswith("copr:")]
         copr_repos = [r for r in all_copr if not self.copr_query or self.copr_query in f"{r['id']} {r['name']}".casefold()]
         enabled = self._enabled_copr_projects()
         self._copr_rows = {}
 
         if self.copr_query:
-            api_heading = Gtk.Label(label=_("Resultados na API do COPR"), xalign=0)
-            api_heading.add_css_class("fs-page-title")
-            body.append(api_heading)
             if self.copr_projects_failed:
                 body.append(self._state_card(
                     _("API do COPR indisponível"),
@@ -1661,8 +2584,12 @@ class FedoraStore(Adw.Application):
 
     # ---------- Detalhes ----------
 
+    def _detail_key(self, package: Package) -> str:
+        return f"{package.source}:{package.flatpak_id or package.repo_id}:{package.name}"
+
     def _kick_detail_info(self, package: Package) -> None:
-        self._detail_pending.add(package.name)
+        key = self._detail_key(package)
+        self._detail_pending.add(key)
         name = package.name
 
         def worker() -> None:
@@ -1671,18 +2598,18 @@ class FedoraStore(Adw.Application):
                 rows = repo.info_rows(name)
             except Exception:
                 rows = []
-            GLib.idle_add(self._detail_loaded, name, rows)
+            GLib.idle_add(self._detail_loaded, key, rows)
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _detail_loaded(self, name: str, rows: list) -> bool:
-        self._detail_pending.discard(name)
+    def _detail_loaded(self, key: str, rows: list) -> bool:
+        self._detail_pending.discard(key)
         if rows:
-            self._detail_info[name] = rows
-            self._detail_failed.discard(name)
+            self._detail_info[key] = rows
+            self._detail_failed.discard(key)
         else:
-            self._detail_failed.add(name)
-        if self.detail_package is not None and self.detail_package.name == name:
+            self._detail_failed.add(key)
+        if self.detail_package is not None and self._detail_key(self.detail_package) == key:
             if rows:
                 self._hydrate_from_info(self.detail_package, rows)
             self.render_page()
@@ -1706,23 +2633,25 @@ class FedoraStore(Adw.Application):
         package = self.detail_package
         if not package:
             return
-        if not package.installed_version:
+        dnf_backed = package.source != "Flatpak"
+        if dnf_backed and not package.installed_version:
             row = self.packages_installed.get(package.name)
             if row:
                 package.installed_version = row.get("evr")
-        if not package.update_version:
+        if dnf_backed and not package.update_version:
             upgrade_row = next((u for u in self.packages_upgrades if u["name"] == package.name), None)
             if upgrade_row:
                 package.update_version = upgrade_row.get("evr")
-        cached = self._detail_info.get(package.name)
+        detail_key = self._detail_key(package)
+        cached = self._detail_info.get(detail_key)
         if cached and not package.version:
             self._hydrate_from_info(package, cached)
-        if not package.version and package.name not in self._detail_pending and package.name not in self._detail_failed:
+        if dnf_backed and not package.version and detail_key not in self._detail_pending and detail_key not in self._detail_failed:
             self._kick_detail_info(package)
         has_data = bool(package.version or package.installed_version or package.repo_id)
         hero = Gtk.Box(spacing=22)
         hero.set_hexpand(True)
-        hero.append(Gtk.Image(icon_name=package.icon, pixel_size=72))
+        hero.append(self._package_image(package, 72))
         texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         texts.set_hexpand(True)
         name = Gtk.Label(label=package.name, xalign=0, wrap=True)
@@ -1753,15 +2682,16 @@ class FedoraStore(Adw.Application):
         body.append(hero)
 
         if not has_data:
-            if package.name in self._detail_failed:
+            provider = "DNF" if dnf_backed else "Flathub"
+            if detail_key in self._detail_failed:
                 body.append(self._state_card(
                     _("Informações indisponíveis"),
-                    _("O DNF não retornou dados para {0}. Tente novamente mais tarde.").format(package.name),
+                    _("O {0} não retornou dados para {1}. Tente novamente mais tarde.").format(provider, package.name),
                     icon="dialog-information-symbolic",
                 ))
             else:
                 body.append(self._state_card(
-                    _("Consultando o DNF"),
+                    _("Consultando {0}").format(provider),
                     _("Buscando informações de {0}…").format(package.name),
                     spinner=True,
                 ))
@@ -1788,7 +2718,7 @@ class FedoraStore(Adw.Application):
         about_heading = Gtk.Label(label=_("Sobre"), xalign=0)
         about_heading.add_css_class("fs-page-title")
         body.append(about_heading)
-        about = Gtk.Label(label=package.summary or _("Sem descrição mestre; veja “dnf info {0}” para detalhes.").format(package.name), xalign=0, wrap=True)
+        about = Gtk.Label(label=package.description or package.summary or _("Sem descrição disponível."), xalign=0, wrap=True)
         about.set_hexpand(True)
         body.append(about)
 
@@ -1804,6 +2734,8 @@ class FedoraStore(Adw.Application):
             (_("Versão disponível"), package.update_version or package.version or _("—")),
             (_("Repositório"), package.repo_id or package.origin),
         ]
+        if package.flatpak_id:
+            rows.append((_("ID do aplicativo"), package.flatpak_id))
         if package.arch:
             rows.append((_("Arquitetura"), package.arch))
         for index, (label, value) in enumerate(rows):
@@ -1819,6 +2751,53 @@ class FedoraStore(Adw.Application):
         body.append(info)
 
     # ---------- Aplicação real ----------
+    def _apply_flatpak(self, package: Package) -> None:
+        if self.busy or not package.flatpak_id:
+            return
+        self.busy = True
+        operation = self._operation(package)
+        self._busy_summary = operation
+        if package.installed:
+            command = ["pkexec", "flatpak", "uninstall", "--system", "-y", package.flatpak_id]
+        else:
+            command = ["pkexec", "flatpak", "install", "--system", "-y", "flathub", package.flatpak_id]
+        self._show_progress([package])
+
+        def worker() -> None:
+            try:
+                result = repo.subprocess_(command, timeout=1800)
+                if result.returncode == 126:
+                    error = "__auth_cancelled__"
+                elif result.returncode == 127:
+                    error = "__auth_failed__"
+                elif result.returncode:
+                    error = (result.stderr or result.stdout or "").strip()[-160:]
+                else:
+                    error = ""
+            except Exception as exception:
+                error = str(exception)[:160]
+            GLib.idle_add(self._finish_flatpak_action, error)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_flatpak_action(self, error: str) -> bool:
+        self.busy = False
+        summary = self._busy_summary
+        self._busy_summary = ""
+        self.flatpak_ready = False
+        self.detail_package = None
+        self._load_flatpak_catalog()
+        self.render_page()
+        if error == "__auth_cancelled__":
+            self._toast(_("Autenticação cancelada — nada foi alterado"))
+        elif error == "__auth_failed__":
+            self._toast(_("Falha de autenticação — nada foi alterado"))
+        elif error:
+            self._toast(_("A operação falhou: {0}").format(error))
+        else:
+            self._toast(_("{0} concluída com sucesso").format(summary))
+        return False
+
 
     def _apply(self, packages: list[Package]) -> None:
         if not packages or self.busy:
@@ -1833,7 +2812,7 @@ class FedoraStore(Adw.Application):
         installs = [p.name for p in packages if not p.installed and not p.updatable]
         removes = [p.name for p in packages if p.installed and not p.updatable]
         if upgrades:
-            commands.append(["pkexec", "dnf", "upgrade", "-y", *upgrades])
+            commands.append(["pkexec", "dnf", "upgrade", "--refresh", "-y", *upgrades])
         if installs:
             commands.append(["pkexec", "dnf", "install", "-y", *installs])
         if removes:
@@ -1854,7 +2833,10 @@ class FedoraStore(Adw.Application):
         def worker():
             try:
                 installed_rows = repo.installed()
-                upgrade_rows = repo.upgrades()
+                try:
+                    upgrade_rows = repo.refresh_upgrades()
+                except Exception:
+                    upgrade_rows = repo.upgrades()
                 repos_rows = repo.repos()
             except Exception:
                 installed_rows, upgrade_rows, repos_rows = self._rows_snapshot()
@@ -1917,32 +2899,47 @@ class FedoraStore(Adw.Application):
     def _show_progress(self, packages: list[Package]) -> None:
         if not self.main_box:
             return
-        self._clear(self.main_box)
-        view = Adw.ToolbarView()
-        header = Adw.HeaderBar()
-        title_label = Gtk.Label(label=HEADER_TITLES[self.page])
-        title_label.add_css_class("fs-header-title")
-        header.set_title_widget(title_label)
-        view.add_top_bar(header)
-        body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        body.set_halign(Gtk.Align.CENTER)
-        body.set_valign(Gtk.Align.CENTER)
-        body.set_vexpand(True)
-        removing = all(self._operation(p) == _("Remover") for p in packages)
-        heading_text = _("Removendo aplicativos") if removing else _("Aplicando alterações com o DNF")
-        heading = Gtk.Label(label=heading_text, xalign=0.5)
+        operations = {self._operation(package) for package in packages}
+        if operations == {_("Instalar")}:
+            heading_text = _("Instalando aplicativo…") if len(packages) == 1 else _("Instalando aplicativos…")
+        elif operations == {_("Atualizar")}:
+            heading_text = _("Atualizando aplicativo…") if len(packages) == 1 else _("Atualizando aplicativos…")
+        elif operations == {_("Remover")}:
+            heading_text = _("Removendo aplicativo…") if len(packages) == 1 else _("Removendo aplicativos…")
+        else:
+            heading_text = _("Aplicando alterações…")
+        subject = packages[0].name if len(packages) == 1 else _(
+            "{0} pacotes selecionados"
+        ).format(len(packages))
+
+        panel = Gtk.Box(spacing=14)
+        panel.set_halign(Gtk.Align.CENTER)
+        panel.set_size_request(640, -1)
+        panel.set_margin_top(12)
+        panel.set_margin_bottom(16)
+        panel.set_margin_start(16)
+        panel.set_margin_end(16)
+        panel.append(Gtk.Spinner(spinning=True))
+        texts = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        texts.set_hexpand(True)
+        heading = Gtk.Label(label=heading_text, xalign=0)
         heading.add_css_class("fs-name")
-        body.append(heading)
-        sub = Gtk.Label(label=_("{0} pacotes. O polkit pode pedir sua senha…").format(len(packages)), xalign=0.5)
+        texts.append(heading)
+        sub = Gtk.Label(
+            label=_("{0}. Isso pode levar alguns instantes.").format(subject),
+            xalign=0,
+        )
+        sub.set_ellipsize(Pango.EllipsizeMode.END)
         sub.add_css_class("dim-label")
-        body.append(sub)
+        texts.append(sub)
+        panel.append(texts)
         progress = Gtk.ProgressBar()
-        progress.set_size_request(440, -1)
+        progress.set_size_request(180, -1)
         progress.add_css_class("fs-progress")
         progress.set_pulse_step(0.12)
-        body.append(progress)
-        view.set_content(body)
-        self.main_box.append(view)
+        progress.set_valign(Gtk.Align.CENTER)
+        panel.append(progress)
+        self.main_box.append(panel)
 
         def pulse():
             progress.pulse()
@@ -1969,7 +2966,7 @@ class FedoraStore(Adw.Application):
             self._toast(_("A operação falhou: {0}").format(errors[0][:130]))
         else:
             self._toast(toast_success)
-        if reload_fn == "repos":
+        if reload_fn in ("repos", "data"):
             self._load_initial()
         return False
 
@@ -1988,8 +2985,12 @@ class FedoraStore(Adw.Application):
         self.window.add_action(toggle_select)
 
     def _act_open_detail(self, _action: Gio.SimpleAction, variant: GLib.Variant) -> None:
-        name = variant.unpack()
-        package = self._pkg(name)
+        target = variant.unpack()
+        package = self._detail_packages.get(target)
+        if package is None and target.startswith("'") and target.endswith("'"):
+            target = target[1:-1].replace("''", "'")
+            package = self._detail_packages.get(target)
+        package = package or self._pkg(target)
         if package:
             self.detail_package = package
             self.render_page()
@@ -2004,5 +3005,7 @@ class FedoraStore(Adw.Application):
 
 
 def main() -> None:
-    app = FedoraStore()
-    raise SystemExit(app.run(sys.argv))
+    background = "--background" in sys.argv
+    args = [arg for arg in sys.argv if arg != "--background"]
+    app = FedoraStore(background=background)
+    raise SystemExit(app.run(args))

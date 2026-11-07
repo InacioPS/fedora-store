@@ -16,6 +16,8 @@ class Package:
     installed_version: Optional[str] = None
     update_version: Optional[str] = None
     arch: str = ""
+    flatpak_id: str = ""
+    icon_url: str = ""
 
     @property
     def installed(self) -> bool:
@@ -27,4 +29,4 @@ class Package:
 
     @property
     def origin(self) -> str:
-        return {"Fedora": "DNF", "Terra": "Terra", "COPR": "COPR"}.get(self.source, "DNF")
+        return {"Fedora": "DNF", "Terra": "Terra", "COPR": "COPR", "Flatpak": "Flatpak"}.get(self.source, "DNF")

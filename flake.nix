@@ -22,6 +22,9 @@
             adwaita-icon-theme
             meson
             ninja
+            flatpak
+            rpm
+            cpio
           ];
           nativeBuildInputs = with pkgs; [ wrapGAppsHook4 ];
           buildInputs = with pkgs; [ gtk4 libadwaita gobject-introspection ];

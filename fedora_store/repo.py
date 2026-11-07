@@ -10,9 +10,12 @@ projects are searched via ``/project/search`` and their packages/maintainer
 data via ``/package/list`` and ``/project/``.
 """
 
+import hashlib
 import json
+import os
 import re
 import shutil
+import subprocess
 import threading
 import urllib.error
 import urllib.parse
@@ -23,10 +26,18 @@ SEARCH_LINE = re.compile(r"^([\w.+-]+)\.([\w.]+)\t(.*)$")
 
 COPR_API = "https://copr.fedorainfracloud.org/api_3"
 COPR_AGENT = "fedora-store/1.0 (+https://github.com/fedastore)"
+FLATHUB_API = "https://flathub.org/api/v2"
+FLATHUB_REPO_URL = "https://dl.flathub.org/repo/flathub.flatpakrepo"
+TERRA_REPO_FILE = Path("/etc/yum.repos.d/terra.repo")
 
 
 def available_on_system() -> bool:
     return Path("/etc/fedora-release").exists() and shutil.which("dnf") is not None
+
+
+def terra_configured() -> bool:
+    """Whether Terra's repository definition already exists on this system."""
+    return TERRA_REPO_FILE.exists()
 
 
 def _run(args: list[str], timeout: int = 180) -> list:
@@ -59,12 +70,56 @@ def upgrades() -> list[dict]:
     return _run(["list", "--upgrades", "--json"])
 
 
+def refresh_upgrades() -> list[dict]:
+    """Refresh DNF metadata and return currently available package upgrades."""
+    process = subprocess_(["dnf", "--refresh", "list", "--upgrades", "--json"], timeout=300)
+    rows = _list_from(process.stdout)
+    if process.returncode not in (0, 100) and not rows:
+        message = (process.stderr or process.stdout or "").strip()
+        raise RuntimeError(message or f"dnf returned {process.returncode}")
+    return rows
+
+
 def available_all() -> list[dict]:
     return _run(["list", "--available", "--json"], timeout=300)
 
 
 def repos() -> list[dict]:
     return _run(["repolist", "--json"])
+
+def _local_rpm_icon(archive: Path) -> str:
+    files = subprocess_(["rpm", "-qlp", str(archive)], timeout=30)
+    candidates = [line.strip() for line in files.stdout.splitlines()
+                  if re.search(r"/(?:icons/hicolor/.+/apps|pixmaps)/.+\.(?:png|svg)$", line, re.I)]
+    if not candidates:
+        return ""
+    member = candidates[0]
+    cache = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "fedora-store" / "rpm-icons"
+    cache.mkdir(parents=True, exist_ok=True)
+    target = cache / f"{hashlib.sha256((str(archive) + member).encode()).hexdigest()}{Path(member).suffix}"
+    if not target.exists():
+        source = subprocess.Popen(["rpm2cpio", str(archive)], stdout=subprocess.PIPE)
+        extracted = subprocess.run(["cpio", "--quiet", "-i", "--to-stdout", f".{member}"],
+                                   stdin=source.stdout, capture_output=True, timeout=30)
+        source.wait(timeout=30)
+        if extracted.returncode or not extracted.stdout:
+            return ""
+        target.write_bytes(extracted.stdout)
+    return str(target)
+
+
+def local_rpm_metadata(path: str | Path) -> dict[str, str]:
+    """Read non-installing metadata and an embedded icon from one RPM archive."""
+    archive = Path(path).expanduser().resolve()
+    if archive.suffix.casefold() != ".rpm" or not archive.is_file():
+        raise ValueError("Selecione um arquivo .rpm existente.")
+    fields = "%{NAME}\n%{VERSION}-%{RELEASE}\n%{ARCH}\n%{SIZE}\n%{SUMMARY}\n"
+    result = subprocess_(["rpm", "-qp", "--qf", fields, str(archive)], timeout=30)
+    if result.returncode != 0:
+        raise RuntimeError((result.stderr or result.stdout or "RPM inválido.").strip())
+    name, version, arch, size, summary = (result.stdout.splitlines() + [""] * 5)[:5]
+    return {"path": str(archive), "name": name, "version": version, "arch": arch, "size": size,
+            "summary": summary, "icon": _local_rpm_icon(archive)}
 
 
 def search(term: str, handle: dict | None = None) -> list[dict]:
@@ -106,6 +161,82 @@ def _copr_get(path: str, params: dict, timeout: int = 30):
         return json.loads(response.read().decode("utf-8"))
 
 
+def _flathub_get(path: str, params: dict | None = None, timeout: int = 15):
+    query = urllib.parse.urlencode(params or {})
+    suffix = f"?{query}" if query else ""
+    request = urllib.request.Request(
+        f"{FLATHUB_API}{path}{suffix}",
+        headers={"Accept": "application/json", "User-Agent": COPR_AGENT},
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _flathub_metadata(app_ids: list[str], limit: int, locale: str) -> list[dict]:
+    """Fetch display metadata for a bounded set of Flathub application IDs."""
+    rows = []
+    for app_id in app_ids[:limit]:
+        if not isinstance(app_id, str):
+            continue
+        try:
+            metadata = _flathub_get(f"/appstream/{urllib.parse.quote(app_id, safe='.')}", {"locale": locale})
+        except Exception:
+            continue
+        if not isinstance(metadata, dict) or metadata.get("is_eol"):
+            continue
+        release = next(iter(metadata.get("releases") or []), {})
+        rows.append({
+            "flatpak_id": app_id,
+            "name": str(metadata.get("name") or app_id),
+            "summary": str(metadata.get("summary") or ""),
+            "description": str(metadata.get("description") or ""),
+            "version": str(release.get("version") or ""),
+            "icon": str(metadata.get("icon") or "application-x-executable-symbolic"),
+        })
+    return rows
+
+
+def flathub_catalog(limit: int = 48, locale: str = "pt-BR") -> list[dict]:
+    """Return a bounded, recently updated set of Flathub application metadata."""
+    app_ids = _flathub_get("/appstream", {"filter": "apps", "sort": "last-updated-at"})
+    return _flathub_metadata(app_ids, limit, locale) if isinstance(app_ids, list) else []
+
+
+def flathub_search(query: str, limit: int = 48, locale: str = "pt-BR") -> list[dict]:
+    """Find Flathub apps by their canonical IDs, then fetch their display metadata."""
+    app_ids = _flathub_get("/appstream", {"filter": "apps", "sort": "alphabetical"})
+    if not isinstance(app_ids, list):
+        return []
+    needle = query.casefold().strip()
+    matches = [app_id for app_id in app_ids if isinstance(app_id, str) and needle in app_id.casefold()]
+    return _flathub_metadata(matches, limit, locale)
+
+
+def download_icon(url: str, timeout: int = 15) -> bytes:
+    """Download one remote AppStream icon for display on the GTK main thread."""
+    request = urllib.request.Request(url, headers={"User-Agent": COPR_AGENT})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return response.read()
+
+
+def flatpak_installed() -> dict[str, dict]:
+    """Return installed Flatpak applications keyed by application ID."""
+    try:
+        process = subprocess_(["flatpak", "list", "--app", "--columns=application,version,origin"], timeout=30)
+    except Exception:
+        return {}
+    rows = {}
+    for line in (process.stdout or "").splitlines():
+        app_id, *values = line.split("\t")
+        if not app_id:
+            continue
+        rows[app_id] = {
+            "version": values[0] if values else "",
+            "origin": values[1] if len(values) > 1 else "",
+        }
+    return rows
+
+
 def copr_search_projects(query: str, limit: int = 6) -> list[dict]:
     """Search COPR projects by keyword (``GET /project/search``)."""
     data = _copr_get("/project/search", {"query": query, "limit": limit})
@@ -124,53 +255,39 @@ def copr_project(owner: str, name: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def copr_packages(owner: str, name: str, limit: int = 60) -> list[dict]:
-    """List the packages built in a project (``GET /package/list``)."""
+def copr_packages(
+    owner: str, name: str, limit: int = 60, include_builds: bool = False
+) -> list[dict]:
+    """List project packages, optionally enriched with their latest build."""
     data = _copr_get("/package/list", {"ownername": owner, "projectname": name})
     items = data.get("items") if isinstance(data, dict) else None
     if items is None:
         items = data if isinstance(data, list) else []
-    return [item for item in items if isinstance(item, dict)][:limit]
-
-
-def copr_search(query: str, projects: int = 3, per_project: int = 40) -> dict:
-    """Search COPR *packages* and projects through the Copr API.
-
-    The API has no global package-search endpoint, so we search projects by
-    keyword and then match package names inside the top hits. Results carry
-    the project and maintainer context needed by the UI.
-    """
-    found_projects = copr_search_projects(query, limit=projects)
-    packages: list[dict] = []
-    seen: set[tuple[str, str, str]] = set()
-    for project in found_projects:
-        owner = str(project.get("ownername") or "")
-        project_name = str(project.get("name") or "")
-        if not owner or not project_name:
+    packages = [item for item in items if isinstance(item, dict)][:limit]
+    if not include_builds:
+        return packages
+    try:
+        builds_data = _copr_get("/build/list", {"ownername": owner, "projectname": name})
+    except Exception:
+        return packages
+    builds = builds_data.get("items") if isinstance(builds_data, dict) else builds_data
+    latest: dict[str, dict] = {}
+    for build in builds if isinstance(builds, list) else []:
+        if not isinstance(build, dict):
             continue
-        try:
-            listed = copr_packages(owner, project_name, limit=per_project)
-        except Exception:
-            listed = []
-        for package in listed:
-            package_name = str(package.get("name") or "")
-            if query.casefold() not in package_name.casefold():
-                continue
-            key = (owner, project_name, package_name)
-            if not package_name or key in seen:
-                continue
-            seen.add(key)
-            packages.append({
-                "name": package_name,
-                "ownername": owner,
-                "projectname": project_name,
-                "project_full_name": str(project.get("full_name") or f"{owner}/{project_name}"),
-                "project_description": str(project.get("description") or ""),
-                "contact": project.get("contact"),
-                "homepage": project.get("homepage"),
-                "source_type": package.get("source_type"),
-            })
-    return {"projects": found_projects, "packages": packages}
+        source = build.get("source_package")
+        package_name = source.get("name") if isinstance(source, dict) else None
+        if not package_name:
+            continue
+        if package_name not in latest or build.get("submitted_on", 0) > latest[package_name].get("submitted_on", 0):
+            latest[package_name] = build
+    for package in packages:
+        build = latest.get(str(package.get("name") or ""))
+        if build:
+            package["latest_build"] = build
+    return packages
+
+
 
 
 def info_rows(name: str) -> list[tuple[str, str, str]]:
@@ -202,6 +319,8 @@ def repo_label(repo_id: str) -> str:
         return "COPR"
     if repo_id == "terra":
         return "Terra"
+    if repo_id == "flathub":
+        return "Flatpak"
     return "Fedora"
 
 
@@ -247,8 +366,8 @@ def first_icon(theme_has_icon, name: str, fallback: str = "application-x-executa
     return fallback
 
 
-def fancy_app_filter(packages: list[dict], limit: int = 48) -> list[dict]:
-    """Heuristic slice of available packages that look like end-user apps."""
+def fancy_app_filter(packages: list[dict], limit: int | None = 48) -> list[dict]:
+    """Return end-user packages, optionally capped for incremental presentation."""
     bad_suffix = re.compile(r"(-devel|-static|-doc(s)?|-langpack|-libs\d*|-data|-plugins?|-lib|"
                             r"-selinux|-debug|-source|-gtest|-gobject|-arch|-wine)$")
     boring_names = ("fonts", "kernel", "python3", "golang", "perl-", "php", "ruby",
@@ -266,7 +385,8 @@ def fancy_app_filter(packages: list[dict], limit: int = 48) -> list[dict]:
             grouped[base]["arch"] = "x86_64"
         elif slot["arch"] != "x86_64":
             slot["arch"] = package["arch"]
-    return list(grouped.values())[:limit]
+    result = list(grouped.values())
+    return result if limit is None else result[:limit]
 
 
 def threading_worker(function, on_done) -> None:
