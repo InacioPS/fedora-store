@@ -265,11 +265,33 @@ def latest_release(timeout: int = 10) -> dict[str, str] | None:
     tag = str(data.get("tag_name") or "").strip()
     if not tag or data.get("draft") or data.get("prerelease"):
         return None
+    rpm_url = ""
+    for asset in data.get("assets") or []:
+        name = str(asset.get("name") or "")
+        if not name.endswith(".rpm") or name.endswith(".src.rpm"):
+            continue
+        url = str(asset.get("browser_download_url") or "")
+        if url and (name.endswith(".noarch.rpm") or not rpm_url):
+            rpm_url = url
+            if name.endswith(".noarch.rpm"):
+                break
     return {
         "tag": tag,
         "version": tag.removeprefix("v"),
         "url": str(data.get("html_url") or ""),
+        "rpm_url": rpm_url,
     }
+
+
+def download_release_rpm(rpm_url: str, dest: Path, timeout: int = 300) -> Path:
+    """Download a GitHub release RPM asset to ``dest`` and return its path."""
+    request = urllib.request.Request(rpm_url, headers={"User-Agent": COPR_AGENT})
+    with (
+        urllib.request.urlopen(request, timeout=timeout) as response,
+        dest.open("wb") as handle,
+    ):
+        shutil.copyfileobj(response, handle)
+    return dest
 
 
 def copr_search_projects(query: str, limit: int = 6) -> list[dict]:

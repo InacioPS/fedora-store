@@ -16,6 +16,7 @@ import json
 import os
 import shlex
 import sys
+import tempfile
 import threading
 from pathlib import Path
 
@@ -157,6 +158,7 @@ class FedoraStore(Adw.Application):
         self._notification_sent = False
         self._release_notification_sent = False
         self.latest_release_info: dict[str, str] | None = None
+        self._update_in_progress = False
         self._indicator = None
         self._background_hold = False
         self.connect("activate", self.on_activate)
@@ -557,8 +559,54 @@ class FedoraStore(Adw.Application):
             _("A versão {0} do Fedora Store está disponível no GitHub.").format(release["version"])
         )
         notification.set_default_action("app.activate")
+        if release.get("rpm_url"):
+            notification.add_button(_("Atualizar"), "app.install-update")
         self.send_notification("release-available", notification)
         self._release_notification_sent = True
+        if self.page == "settings":
+            self.render_page()
+        return False
+
+    def _act_install_update(self, _action: Gio.SimpleAction, _parameter: GLib.Variant | None) -> None:
+        self._start_app_update()
+
+    def _start_app_update(self) -> None:
+        """Download the release RPM and install it through Polkit/dnf."""
+        if self._update_in_progress:
+            return
+        release = self.latest_release_info
+        if not release or not release.get("rpm_url"):
+            self._toast(_("Nenhuma atualização disponível."))
+            return
+        self._update_in_progress = True
+        if self.page == "settings":
+            self.render_page()
+        self._toast(_("Baixando a versão {0}…").format(release["version"]))
+
+        def worker() -> None:
+            errors: str | None = None
+            try:
+                dest = Path(tempfile.gettempdir()) / f"fedora-store-{release['version']}.noarch.rpm"
+                rpm_path = repo.download_release_rpm(release["rpm_url"], dest)
+                result = repo.subprocess_(
+                    ["pkexec", "dnf", "install", "-y", str(rpm_path)],
+                    timeout=900,
+                )
+                if result.returncode != 0:
+                    tail = (result.stderr or result.stdout or "").strip().splitlines()[-1:]
+                    errors = tail[0] if tail else f"exit {result.returncode}"
+            except Exception as error:
+                errors = str(error)[:160]
+            GLib.idle_add(self._finish_app_update, errors, release["version"])
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _finish_app_update(self, errors: str | None, version: str) -> bool:
+        self._update_in_progress = False
+        if errors:
+            self._toast(_("A atualização falhou: {0}").format(errors[:130]))
+        else:
+            self._toast(_("Versão {0} instalada. Reinicie o aplicativo para usá-la.").format(version))
         if self.page == "settings":
             self.render_page()
         return False
@@ -2470,6 +2518,22 @@ class FedoraStore(Adw.Application):
         version.set_margin_top(22)
         body.append(version)
 
+        release = self.latest_release_info
+        if (
+            release
+            and release.get("rpm_url")
+            and self._version_key(release["version"]) > self._version_key(APP_VERSION)
+        ):
+            if self._update_in_progress:
+                update = Gtk.Button(label=_("Atualizando…"), sensitive=False)
+            else:
+                update = Gtk.Button(label=_("Atualizar para {0}").format(release["version"]))
+                update.connect("clicked", lambda *_: self._start_app_update())
+            update.add_css_class("suggested-action")
+            update.set_halign(Gtk.Align.START)
+            update.set_margin_top(10)
+            body.append(update)
+
     def _sources(self, body: Gtk.Box) -> None:
         self._page_block(body, _("Fontes de aplicativos"), _("Repositórios configurados no DNF neste computador."))
         if not self.ready:
@@ -3159,6 +3223,10 @@ class FedoraStore(Adw.Application):
             navigation = Gio.SimpleAction.new(name, None)
             navigation.connect("activate", self._set_navigation_mode, mode)
             self.add_action(navigation)
+        if not self.has_action("install-update"):
+            install_update = Gio.SimpleAction.new("install-update", None)
+            install_update.connect("activate", self._act_install_update)
+            self.add_action(install_update)
 
     def _act_open_detail(self, _action: Gio.SimpleAction, variant: GLib.Variant) -> None:
         target = variant.unpack()
