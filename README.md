@@ -2,6 +2,12 @@
 
 Loja gráfica para explorar aplicativos e pacotes Fedora, com foco em transparência de origem e compatibilidade com sessões de window manager.
 
+## Prévia
+
+![Catálogo da Fedora Store](preview/Screenshot%20from%202026-11-08%2000-11-28.png)
+
+![Configurações da Fedora Store](preview/Screenshot%20from%202026-11-08%2000-28-00.png)
+
 ## Ambiente de desenvolvimento
 
 Requer Nix com flakes e direnv. Na primeira utilização:
